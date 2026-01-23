@@ -265,6 +265,10 @@ func (db *SqliteJournalBatchQ) GetQueueJobs(ctx context.Context, showAll bool, s
 	return db.base.GetQueueJobs(ctx, showAll, sortByStatus)
 }
 
+func (db *SqliteJournalBatchQ) SearchJobs(ctx context.Context, query string, statuses []jobs.StatusCode) []*jobs.JobDef {
+	return db.base.SearchJobs(ctx, query, statuses)
+}
+
 func (db *SqliteJournalBatchQ) CancelJob(ctx context.Context, jobId string, reason string) bool {
 	job := db.base.GetJob(ctx, jobId)
 	if job == nil {
