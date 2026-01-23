@@ -86,7 +86,10 @@ func JobLimitProc(val int) JobLimit {
 
 func OpenDB(dbpath string) (BatchDB, error) {
 	if dbpath[:10] == "sqlite3://" {
-		return openSqlite3(dbpath[10:]), nil
+		return openSqlite3(dbpath[10:], false), nil
+	}
+	if dbpath[:18] == "sqlite3-journal://" {
+		return openSqlite3Journal(dbpath[18:]), nil
 	}
 	return nil, fmt.Errorf("bad dbpath: %s", dbpath)
 }
@@ -94,6 +97,9 @@ func OpenDB(dbpath string) (BatchDB, error) {
 func InitDB(dbpath string, force bool) error {
 	if dbpath[:10] == "sqlite3://" {
 		return initSqlite3(dbpath[10:], force)
+	}
+	if dbpath[:18] == "sqlite3-journal://" {
+		return initSqlite3(dbpath[18:], force)
 	}
 	return fmt.Errorf("bad dbpath: %s", dbpath)
 }

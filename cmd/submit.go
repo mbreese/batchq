@@ -347,26 +347,32 @@ var submitCmd = &cobra.Command{
 
 		var jobq db.BatchDB
 		var err error
-		if jobq, err = db.OpenDB(dbpath); err != nil {
+		if jobq, err = openBatchDB(); err != nil {
 			log.Fatalln(err)
 		}
-		defer jobq.Close()
+		success := false
+		defer func() {
+			closeBatchDB(jobq, success)
+		}()
 
 		baddep := false
+		journaled := strings.HasPrefix(dbpath, "sqlite3-journal://")
 		for _, val := range strings.Split(jobDeps, ",") {
 			depid := strings.TrimSpace(val)
 			if depid == "" {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
+			if !journaled {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
 
-			// fmt.Println("Checking dep: ", depid)
-			dep := jobq.GetJob(ctx, depid)
-			if dep == nil || dep.Status == jobs.CANCELED || dep.Status == jobs.FAILED {
-				// bad dependency
-				fmt.Fprintf(os.Stderr, "ERROR: Bad job dependency: %s\n", depid)
-				baddep = true
+				// fmt.Println("Checking dep: ", depid)
+				dep := jobq.GetJob(ctx, depid)
+				if dep == nil || dep.Status == jobs.CANCELED || dep.Status == jobs.FAILED {
+					// bad dependency
+					fmt.Fprintf(os.Stderr, "ERROR: Bad job dependency: %s\n", depid)
+					baddep = true
+				}
 			}
 			job.AddAfterOk(depid)
 		}
@@ -380,6 +386,7 @@ var submitCmd = &cobra.Command{
 		// fmt.Println("Submitting job")
 		job = jobq.SubmitJob(ctx, job)
 		fmt.Printf("%s\n", job.JobId)
+		success = true
 
 	},
 }
