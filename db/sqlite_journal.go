@@ -1,9 +1,11 @@
 package db
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -245,6 +247,22 @@ func (db *SqliteJournalBatchQ) GetJob(ctx context.Context, jobId string) *jobs.J
 
 func (db *SqliteJournalBatchQ) GetJobs(ctx context.Context, showAll bool, sortByStatus bool) []*jobs.JobDef {
 	return db.base.GetJobs(ctx, showAll, sortByStatus)
+}
+
+func (db *SqliteJournalBatchQ) GetJobsByStatus(ctx context.Context, statuses []jobs.StatusCode, sortByStatus bool) []*jobs.JobDef {
+	return db.base.GetJobsByStatus(ctx, statuses, sortByStatus)
+}
+
+func (db *SqliteJournalBatchQ) GetJobDependents(ctx context.Context, jobId string) []string {
+	return db.base.GetJobDependents(ctx, jobId)
+}
+
+func (db *SqliteJournalBatchQ) GetJobStatusCounts(ctx context.Context, showAll bool) map[jobs.StatusCode]int {
+	return db.base.GetJobStatusCounts(ctx, showAll)
+}
+
+func (db *SqliteJournalBatchQ) GetQueueJobs(ctx context.Context, showAll bool, sortByStatus bool) []*jobs.JobDef {
+	return db.base.GetQueueJobs(ctx, showAll, sortByStatus)
 }
 
 func (db *SqliteJournalBatchQ) CancelJob(ctx context.Context, jobId string, reason string) bool {
