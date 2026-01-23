@@ -92,6 +92,7 @@ Example `~/.batchq/config`:
 [batchq]
 runner = simple            # or slurm
 dbpath = sqlite3:///path/to/batchq.db
+journal_writes = false
 journal_merge_on_end = false
 journal_merge_lock_timeout_sec = 30
 journal_merge_lock_quiet = false
@@ -122,12 +123,13 @@ Hidden helper: `batchq debug` shows config and paths.
 
 ### Journaled SQLite (network filesystems)
 
-If your DB lives on NFS/Lustre, use the journaled backend to avoid concurrent SQLite writers. Writers append JSONL entries to per-process journal files, and the merge step applies them to the main DB.
+If your DB lives on NFS/Lustre, enable journaled writes to avoid concurrent SQLite writers. Writers append JSONL entries to per-process journal files, and the merge step applies them to the main DB.
 
 Config:
 ```
 [batchq]
-dbpath = sqlite3-journal:///path/to/batchq.db
+dbpath = sqlite3:///path/to/batchq.db
+journal_writes = true
 journal_merge_on_end = true
 journal_merge_lock_timeout_sec = 30
 journal_merge_lock_quiet = false

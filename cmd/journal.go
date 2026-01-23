@@ -13,6 +13,9 @@ var journalMergeCmd = &cobra.Command{
 	Use:   "journal-merge",
 	Short: "Merge journal entries into the main database",
 	Run: func(cmd *cobra.Command, args []string) {
+		if !journalWrites {
+			log.Fatalln("journal_writes is disabled")
+		}
 		if err := db.MergeJournalsForWriter(dbpath, "", time.Duration(journalMergeLockTimeoutSec)*time.Second); err != nil {
 			log.Fatalln(err)
 		}

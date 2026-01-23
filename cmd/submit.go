@@ -356,7 +356,7 @@ var submitCmd = &cobra.Command{
 		}()
 
 		baddep := false
-		journaled := strings.HasPrefix(dbpath, "sqlite3-journal://")
+		journaled := journalWrites
 		for _, val := range strings.Split(jobDeps, ",") {
 			depid := strings.TrimSpace(val)
 			if depid == "" {

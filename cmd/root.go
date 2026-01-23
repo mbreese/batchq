@@ -64,6 +64,7 @@ var force bool
 var journalMergeOnEnd bool
 var journalMergeLockTimeoutSec int
 var journalMergeLockQuiet bool
+var journalWrites bool
 
 func init() {
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
@@ -80,6 +81,9 @@ func init() {
 		Config = iniconfig.LoadConfig(configFile, "batchq")
 		defDB, _ := support.ExpandPathAbs(filepath.Join(batchqHome, "batchq.db"))
 		dbpath, _ = Config.Get("", "dbpath", "sqlite3://"+defDB) // ok is always true with a defval
+		if val, ok := Config.GetBool("batchq", "journal_writes", false); ok {
+			journalWrites = val
+		}
 		if val, ok := Config.GetBool("batchq", "journal_merge_on_end", false); ok {
 			journalMergeOnEnd = val
 		}

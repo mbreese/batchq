@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -35,10 +34,10 @@ func MergeJournals(dbpath string) error {
 }
 
 func MergeJournalsForWriter(dbpath string, writerID string, lockTimeout time.Duration) error {
-	if !strings.HasPrefix(dbpath, "sqlite3-journal://") {
-		return fmt.Errorf("dbpath does not use sqlite3-journal://")
+	basePath, _, err := parseDBPath(dbpath)
+	if err != nil {
+		return err
 	}
-	basePath := dbpath[len("sqlite3-journal://"):]
 	journalDir := filepath.Dir(basePath)
 
 	pattern := "journal-*.log"
