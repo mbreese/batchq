@@ -30,4 +30,7 @@ clean:
 run:
 	CGO_ENABLED=1 go run main.go
 
-.PHONY: run clean
+test:
+	CGO_ENABLED=1 go test ./...
+
+.PHONY: run clean test

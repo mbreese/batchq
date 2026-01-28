@@ -13,8 +13,28 @@ on:
   pull_request:
     branches: [ "main" ]    
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Install sqlite dev libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 libsqlite3-dev
+
+      - name: Run unit tests
+        run: |
+          make test
+
   build-macos:
     runs-on: macos-14
+    needs: [test]
     steps:
       - uses: actions/checkout@v3
 
@@ -64,6 +84,7 @@ jobs:
           path: bin/batchq.macos_arm64${{ env.BRANCH_SUFFIX }}
   build-linux-amd64:
     runs-on: ubuntu-latest
+    needs: [test]
     steps:
       - uses: actions/checkout@v3
 
@@ -100,6 +121,7 @@ jobs:
 
   build-linux-arm64:
     runs-on: ubuntu-latest
+    needs: [test]
     steps:
       - uses: actions/checkout@v3
 
