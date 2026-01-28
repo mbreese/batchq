@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mbreese/batchq/db"
 	"github.com/spf13/cobra"
 )
 
@@ -22,10 +21,13 @@ var holdCmd = &cobra.Command{
 			return
 		}
 
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			jobIds, err := expandJobArgs(args)
 			if err != nil {
 				fmt.Printf("Bad job-id: %s\n", err.Error())
@@ -41,6 +43,7 @@ var holdCmd = &cobra.Command{
 					fmt.Printf("Error holding job: %s\n", jobid)
 				}
 			}
+			success = true
 		}
 	},
 }
@@ -54,10 +57,13 @@ var releaseCmd = &cobra.Command{
 			return
 		}
 
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			jobIds, err := expandJobArgs(args)
 			if err != nil {
 				fmt.Printf("Bad job-id: %s\n", err.Error())
@@ -73,6 +79,7 @@ var releaseCmd = &cobra.Command{
 					fmt.Printf("Error releasing job: %s\n", jobid)
 				}
 			}
+			success = true
 		}
 	},
 }
@@ -86,10 +93,13 @@ var cancelCmd = &cobra.Command{
 			return
 		}
 
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			jobIds, err := expandJobArgs(args)
 			if err != nil {
 				fmt.Printf("Bad job-id: %s\n", err.Error())
@@ -116,6 +126,7 @@ var cancelCmd = &cobra.Command{
 					}
 				}
 			}
+			success = true
 		}
 	},
 }
@@ -129,10 +140,13 @@ var topCmd = &cobra.Command{
 			return
 		}
 
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			jobIds, err := expandJobArgs(args)
 			if err != nil {
 				fmt.Printf("Bad job-id: %s\n", err.Error())
@@ -148,6 +162,7 @@ var topCmd = &cobra.Command{
 					fmt.Printf("Error prioritizing job: %s\n", jobid)
 				}
 			}
+			success = true
 		}
 	},
 }
@@ -161,10 +176,13 @@ var niceCmd = &cobra.Command{
 			return
 		}
 
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			jobIds, err := expandJobArgs(args)
 			if err != nil {
 				fmt.Printf("Bad job-id: %s\n", err.Error())
@@ -180,6 +198,7 @@ var niceCmd = &cobra.Command{
 					fmt.Printf("Error de-prioritizing job: %s\n", jobid)
 				}
 			}
+			success = true
 		}
 	},
 }

@@ -6,7 +6,6 @@ import (
 	"os/user"
 	"strings"
 
-	"github.com/mbreese/batchq/db"
 	"github.com/mbreese/batchq/jobs"
 	"github.com/mbreese/batchq/runner"
 	"github.com/spf13/cobra"
@@ -17,10 +16,13 @@ var runCmd = &cobra.Command{
 	Short: "Run jobs",
 	Run: func(cmd *cobra.Command, args []string) {
 
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			var runr runner.Runner
 			runnerType := "simple"
 			if slurmRunner {
@@ -120,6 +122,7 @@ var runCmd = &cobra.Command{
 			}
 			if runr != nil {
 				runr.Start()
+				success = true
 			}
 		}
 	},

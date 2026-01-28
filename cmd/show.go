@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mbreese/batchq/db"
 	"github.com/mbreese/batchq/jobs"
 	"github.com/spf13/cobra"
 )
@@ -19,10 +18,13 @@ var detailsCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			for _, ids := range args {
 				for _, spl := range strings.Split(ids, ",") {
 					jobid := strings.TrimSpace(spl)
@@ -35,6 +37,7 @@ var detailsCmd = &cobra.Command{
 					}
 				}
 			}
+			success = true
 		}
 	},
 }
@@ -43,10 +46,13 @@ var queueCmd = &cobra.Command{
 	Use:   "queue",
 	Short: "Show the job queue",
 	Run: func(cmd *cobra.Command, args []string) {
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			fmt.Printf("| %-36.36s ", "jobid")
 			fmt.Printf("| %-8.8s ", "status")
 			fmt.Printf("| %-20.20s ", "job-name")
@@ -123,6 +129,7 @@ var queueCmd = &cobra.Command{
 					fmt.Println("")
 				}
 			}
+			success = true
 		}
 	},
 }
@@ -131,10 +138,13 @@ var statusCmd = &cobra.Command{
 	Use:   "status {job1 job2...}",
 	Short: "Status for a job",
 	Run: func(cmd *cobra.Command, args []string) {
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			if len(args) == 0 {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
@@ -158,6 +168,7 @@ var statusCmd = &cobra.Command{
 					}
 				}
 			}
+			success = true
 		}
 	},
 }
@@ -166,10 +177,13 @@ var summaryCmd = &cobra.Command{
 	Use:   "summary",
 	Short: "Summary of the job queue",
 	Run: func(cmd *cobra.Command, args []string) {
-		if jobq, err := db.OpenDB(dbpath); err != nil {
+		if jobq, err := openBatchDB(); err != nil {
 			log.Fatalln(err)
 		} else {
-			defer jobq.Close()
+			success := false
+			defer func() {
+				closeBatchDB(jobq, success)
+			}()
 			if len(args) == 0 {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
@@ -181,6 +195,7 @@ var summaryCmd = &cobra.Command{
 					}
 				}
 			}
+			success = true
 		}
 	},
 }

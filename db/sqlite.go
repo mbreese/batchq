@@ -28,9 +28,10 @@ type SqliteBatchQ struct {
 	conLock         sync.Mutex
 	lastUpdate      *time.Time
 	updateFrequency time.Duration
+	readOnly        bool
 }
 
-func openSqlite3(fname string) *SqliteBatchQ {
+func openSqlite3(fname string, readOnly bool) *SqliteBatchQ {
 	// f, err := os.Open(fname)
 	// if err == nil {
 	// 	f.Close()
@@ -38,7 +39,7 @@ func openSqlite3(fname string) *SqliteBatchQ {
 	// 	// InitDB(fname)
 	// }
 
-	db := SqliteBatchQ{fname: fname, updateFrequency: defaultUpdateFrequency}
+	db := SqliteBatchQ{fname: fname, updateFrequency: defaultUpdateFrequency, readOnly: readOnly}
 	return &db
 }
 
@@ -147,7 +148,13 @@ func (db *SqliteBatchQ) connect() *sql.DB {
 		log.Fatal("Missing database. Please initialize it first!")
 	}
 
-	conn, err := sql.Open("sqlite3", fmt.Sprintf("file://%s?_txlock=immediate&_busy_timeout=5000&_synchronous=full&_fk=true", db.fname))
+	connStr := ""
+	if db.readOnly {
+		connStr = fmt.Sprintf("file:%s?mode=ro&_busy_timeout=5000&_fk=true", db.fname)
+	} else {
+		connStr = fmt.Sprintf("file://%s?_txlock=immediate&_busy_timeout=5000&_synchronous=full&_fk=true", db.fname)
+	}
+	conn, err := sql.Open("sqlite3", connStr)
 	// conn, err := sql.Open("sqlite3", fmt.Sprintf("file://%s?_journal_mode=wal&_txlock=immediate&_busy_timeout=5000&_synchronous=full&_fk=true", db.fname))
 	//conn, err := sql.Open("sqlite3", fmt.Sprintf("%s?_busy_timeout=5000", db.fname))
 	if err != nil {

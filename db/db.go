@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/mbreese/batchq/jobs"
 )
@@ -84,16 +85,41 @@ func JobLimitProc(val int) JobLimit {
 	return JobLimit{limitType: JobLimitTypeProc, value: val}
 }
 
-func OpenDB(dbpath string) (BatchDB, error) {
-	if dbpath[:10] == "sqlite3://" {
-		return openSqlite3(dbpath[10:]), nil
+const sqlitePrefix = "sqlite3://"
+
+func parseDBPath(dbpath string) (string, bool, error) {
+	if strings.HasPrefix(dbpath, sqlitePrefix) {
+		return dbpath[len(sqlitePrefix):], false, nil
 	}
-	return nil, fmt.Errorf("bad dbpath: %s", dbpath)
+	return "", false, fmt.Errorf("bad dbpath: %s", dbpath)
+}
+
+func OpenDB(dbpath string) (BatchDB, error) {
+	basePath, journalWrites, err := parseDBPath(dbpath)
+	if err != nil {
+		return nil, err
+	}
+	if journalWrites {
+		return openSqlite3Journal(basePath), nil
+	}
+	return openSqlite3(basePath, false), nil
+}
+
+func OpenDBWithJournal(dbpath string, journalWrites bool) (BatchDB, error) {
+	basePath, pathJournalWrites, err := parseDBPath(dbpath)
+	if err != nil {
+		return nil, err
+	}
+	if journalWrites || pathJournalWrites {
+		return openSqlite3Journal(basePath), nil
+	}
+	return openSqlite3(basePath, false), nil
 }
 
 func InitDB(dbpath string, force bool) error {
-	if dbpath[:10] == "sqlite3://" {
-		return initSqlite3(dbpath[10:], force)
+	basePath, _, err := parseDBPath(dbpath)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("bad dbpath: %s", dbpath)
+	return initSqlite3(basePath, force)
 }
