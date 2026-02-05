@@ -12,4 +12,4 @@ require github.com/spf13/cobra v1.9.1
 
 require github.com/google/uuid v1.6.0
 
-require github.com/mbreese/socketlock v0.0.0-20260205084203-8200b85dfddf
+require github.com/mbreese/socketlock v0.1.0
