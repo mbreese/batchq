@@ -17,6 +17,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mbreese/batchq/jobs"
 	"github.com/mbreese/batchq/support"
+	"github.com/mbreese/socketlock"
 )
 
 const defaultUpdateFrequency = 2 * time.Minute
@@ -28,6 +29,9 @@ type SqliteBatchQ struct {
 	conLock         sync.Mutex
 	lastUpdate      *time.Time
 	updateFrequency time.Duration
+	lockPath        string
+	lockClient      *socketlock.Client
+	lockMu          sync.Mutex
 }
 
 func openSqlite3(fname string) *SqliteBatchQ {
@@ -38,12 +42,20 @@ func openSqlite3(fname string) *SqliteBatchQ {
 	// 	// InitDB(fname)
 	// }
 
-	db := SqliteBatchQ{fname: fname, updateFrequency: defaultUpdateFrequency}
+	db := SqliteBatchQ{fname: fname, updateFrequency: defaultUpdateFrequency, lockPath: socketLockPathOrDefault()}
 	return &db
 }
 
 func initSqlite3(fname string, force bool) error {
 	fmt.Printf("Initializing sqlite db: %s\n", fname)
+
+	lockCtx, cancel := lockTimeoutContext()
+	defer cancel()
+	lockClient, lock, err := acquireSocketLock(lockCtx, socketLockPathOrDefault(), true)
+	if err != nil {
+		return fmt.Errorf("socketlock acquire write: %w", err)
+	}
+	defer releaseSocketLock(lockClient, lock)
 
 	if f, err := os.Open(fname); err == nil {
 		f.Close()
@@ -128,6 +140,55 @@ func initSqlite3(fname string, force bool) error {
 	return nil
 }
 
+func (db *SqliteBatchQ) ensureLockClient(ctx context.Context) (*socketlock.Client, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db.lockMu.Lock()
+	defer db.lockMu.Unlock()
+	if db.lockClient != nil {
+		return db.lockClient, nil
+	}
+	if strings.TrimSpace(db.lockPath) == "" {
+		db.lockPath = socketLockPathOrDefault()
+	}
+	if err := ensureSocketDir(db.lockPath); err != nil {
+		return nil, err
+	}
+	client, err := socketlock.Connect(ctx, db.lockPath, socketlock.LockConfig{
+		Policy: socketlock.WriterPreferred,
+	})
+	if err != nil {
+		return nil, err
+	}
+	db.lockClient = client
+	return client, nil
+}
+
+func (db *SqliteBatchQ) acquireLock(ctx context.Context, write bool) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	client, err := db.ensureLockClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var lock *socketlock.Lock
+	if write {
+		lock, err = client.AcquireWrite(ctx)
+	} else {
+		lock, err = client.AcquireRead(ctx)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return func() {
+		_ = lock.Release()
+	}, nil
+}
+
 // Each method will connect on it's own, this is because there is no row-level locking of the database, and
 // this db could be accessed from different processes (potentially over a network share). So, in order to
 // keep locking to a minimum, we'll just open the db and close it for each function call.
@@ -179,6 +240,13 @@ func (db *SqliteBatchQ) close() {
 }
 
 func (db *SqliteBatchQ) SubmitJob(ctx context.Context, job *jobs.JobDef) *jobs.JobDef {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (SubmitJob): %v", err)
+		return nil
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -251,6 +319,12 @@ func (db *SqliteBatchQ) SubmitJob(ctx context.Context, job *jobs.JobDef) *jobs.J
 }
 
 func (db *SqliteBatchQ) GetJobs(ctx context.Context, showAll bool, sortByStatus bool) []*jobs.JobDef {
+	unlock, err := db.acquireLock(ctx, false)
+	if err != nil {
+		log.Printf("socketlock read failed (GetJobs): %v", err)
+		return nil
+	}
+	defer unlock()
 	conn := db.connect()
 	defer db.close()
 
@@ -377,6 +451,12 @@ func (db *SqliteBatchQ) GetJobs(ctx context.Context, showAll bool, sortByStatus 
 }
 
 func (db *SqliteBatchQ) GetJobsByStatus(ctx context.Context, statuses []jobs.StatusCode, sortByStatus bool) []*jobs.JobDef {
+	unlock, err := db.acquireLock(ctx, false)
+	if err != nil {
+		log.Printf("socketlock read failed (GetJobsByStatus): %v", err)
+		return nil
+	}
+	defer unlock()
 	if len(statuses) == 0 {
 		return []*jobs.JobDef{}
 	}
@@ -443,18 +523,25 @@ func (db *SqliteBatchQ) GetJobsByStatus(ctx context.Context, statuses []jobs.Sta
 }
 
 func (db *SqliteBatchQ) GetJobStatusCounts(ctx context.Context, showAll bool) map[jobs.StatusCode]int {
+	unlock, err := db.acquireLock(ctx, false)
+	if err != nil {
+		log.Printf("socketlock read failed (GetJobStatusCounts): %v", err)
+		return map[jobs.StatusCode]int{}
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
 	counts := map[jobs.StatusCode]int{
-		jobs.USERHOLD:   0,
-		jobs.WAITING:    0,
-		jobs.QUEUED:     0,
+		jobs.USERHOLD:    0,
+		jobs.WAITING:     0,
+		jobs.QUEUED:      0,
 		jobs.PROXYQUEUED: 0,
-		jobs.RUNNING:    0,
-		jobs.SUCCESS:    0,
-		jobs.FAILED:     0,
-		jobs.CANCELED:   0,
+		jobs.RUNNING:     0,
+		jobs.SUCCESS:     0,
+		jobs.FAILED:      0,
+		jobs.CANCELED:    0,
 	}
 
 	sql := "SELECT status, COUNT(*) FROM jobs"
@@ -484,6 +571,13 @@ func (db *SqliteBatchQ) GetJobStatusCounts(ctx context.Context, showAll bool) ma
 }
 
 func (db *SqliteBatchQ) GetQueueJobs(ctx context.Context, showAll bool, sortByStatus bool) []*jobs.JobDef {
+	unlock, err := db.acquireLock(ctx, false)
+	if err != nil {
+		log.Printf("socketlock read failed (GetQueueJobs): %v", err)
+		return nil
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -702,6 +796,13 @@ func (db *SqliteBatchQ) SearchJobs(ctx context.Context, query string, statuses [
 		return nil
 	}
 
+	unlock, err := db.acquireLock(ctx, false)
+	if err != nil {
+		log.Printf("socketlock read failed (SearchJobs): %v", err)
+		return nil
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -823,6 +924,13 @@ func parseRunningDetails(raw string) []jobs.JobRunningDetail {
 
 // func (db *SqliteBatchQ) FetchNext(ctx context.Context, freeProc int, freeMemMB int, freeTimeSec int) (*jobs.JobDef, bool) {
 func (db *SqliteBatchQ) FetchNext(ctx context.Context, limits []JobLimit) (*jobs.JobDef, bool) {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (FetchNext): %v", err)
+		return nil, false
+	}
+	defer unlock()
+
 	// First, update all WAITING jobs to QUEUED if they have no outstanding dependencies
 	// fmt.Println("Updating queue...")
 	db.updateQueue(ctx)
@@ -914,6 +1022,7 @@ func (db *SqliteBatchQ) FetchNext(ctx context.Context, limits []JobLimit) (*jobs
 }
 
 func (db *SqliteBatchQ) updateQueue(ctx context.Context, parentJobId ...string) {
+	// Caller must hold a write lock.
 	if len(parentJobId) == 0 && db.lastUpdate != nil {
 		now := time.Now().UTC()
 		if now.Sub(*db.lastUpdate) < db.updateFrequency {
@@ -1018,6 +1127,12 @@ func (db *SqliteBatchQ) updateQueue(ctx context.Context, parentJobId ...string) 
 }
 
 func (db *SqliteBatchQ) GetJob(ctx context.Context, jobId string) *jobs.JobDef {
+	unlock, err := db.acquireLock(ctx, false)
+	if err != nil {
+		log.Printf("socketlock read failed (GetJob): %v", err)
+		return nil
+	}
+	defer unlock()
 	conn := db.connect()
 	defer db.close()
 
@@ -1117,6 +1232,13 @@ func (db *SqliteBatchQ) GetJob(ctx context.Context, jobId string) *jobs.JobDef {
 }
 
 func (db *SqliteBatchQ) GetJobDependents(ctx context.Context, jobId string) []string {
+	unlock, err := db.acquireLock(ctx, false)
+	if err != nil {
+		log.Printf("socketlock read failed (GetJobDependents): %v", err)
+		return nil
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1139,6 +1261,12 @@ func (db *SqliteBatchQ) GetJobDependents(ctx context.Context, jobId string) []st
 }
 
 func (db *SqliteBatchQ) CancelJob(ctx context.Context, jobId string, reason string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (CancelJob): %v", err)
+		return false
+	}
+	defer unlock()
 	conn := db.connect()
 	defer db.close()
 
@@ -1189,6 +1317,13 @@ func (db *SqliteBatchQ) CancelJob(ctx context.Context, jobId string, reason stri
 	return false
 }
 func (db *SqliteBatchQ) ProxyEndJob(ctx context.Context, jobId string, newStatus jobs.StatusCode, startTime string, endTime string, returnCode int) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (ProxyEndJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1246,10 +1381,17 @@ func (db *SqliteBatchQ) ProxyEndJob(ctx context.Context, jobId string, newStatus
 }
 
 func (db *SqliteBatchQ) ProxyQueueJob(ctx context.Context, jobId string, jobRunner string, runDetail map[string]string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (ProxyQueueJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 
 	sql := "INSERT INTO job_running (job_id, job_runner) VALUES (?,?)"
-	_, err := conn.ExecContext(ctx, sql, jobId, jobRunner)
+	_, err = conn.ExecContext(ctx, sql, jobId, jobRunner)
 	if err != nil {
 		db.close()
 		return false
@@ -1312,6 +1454,13 @@ func (db *SqliteBatchQ) ProxyQueueJob(ctx context.Context, jobId string, jobRunn
 }
 
 func (db *SqliteBatchQ) UpdateJobRunningDetails(ctx context.Context, jobId string, details map[string]string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (UpdateJobRunningDetails): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1334,10 +1483,17 @@ func (db *SqliteBatchQ) UpdateJobRunningDetails(ctx context.Context, jobId strin
 }
 
 func (db *SqliteBatchQ) StartJob(ctx context.Context, jobId string, jobRunner string, runDetail map[string]string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (StartJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 
 	sql := "INSERT INTO job_running (job_id, job_runner) VALUES (?,?)"
-	_, err := conn.ExecContext(ctx, sql, jobId, jobRunner)
+	_, err = conn.ExecContext(ctx, sql, jobId, jobRunner)
 	if err != nil {
 		db.close()
 		return false
@@ -1398,6 +1554,13 @@ func (db *SqliteBatchQ) StartJob(ctx context.Context, jobId string, jobRunner st
 }
 
 func (db *SqliteBatchQ) EndJob(ctx context.Context, jobId string, jobRunner string, returnCode int) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (EndJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1458,9 +1621,24 @@ func (db *SqliteBatchQ) Close() {
 		db.dbConn = nil
 	}
 	db.conLock.Unlock()
+
+	db.lockMu.Lock()
+	client := db.lockClient
+	db.lockClient = nil
+	db.lockMu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
 }
 
 func (db *SqliteBatchQ) CleanupJob(ctx context.Context, jobId string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (CleanupJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1491,6 +1669,13 @@ func (db *SqliteBatchQ) CleanupJob(ctx context.Context, jobId string) bool {
 
 // increase the priority for a queued/held/waiting job to the top of the queue
 func (db *SqliteBatchQ) TopJob(ctx context.Context, jobId string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (TopJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1507,6 +1692,13 @@ func (db *SqliteBatchQ) TopJob(ctx context.Context, jobId string) bool {
 
 // decrease the priority for a queued/held/waiting job
 func (db *SqliteBatchQ) NiceJob(ctx context.Context, jobId string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (NiceJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1522,6 +1714,13 @@ func (db *SqliteBatchQ) NiceJob(ctx context.Context, jobId string) bool {
 }
 
 func (db *SqliteBatchQ) HoldJob(ctx context.Context, jobId string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (HoldJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1537,6 +1736,13 @@ func (db *SqliteBatchQ) HoldJob(ctx context.Context, jobId string) bool {
 }
 
 func (db *SqliteBatchQ) ReleaseJob(ctx context.Context, jobId string) bool {
+	unlock, err := db.acquireLock(ctx, true)
+	if err != nil {
+		log.Printf("socketlock write failed (ReleaseJob): %v", err)
+		return false
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 
@@ -1554,6 +1760,13 @@ func (db *SqliteBatchQ) ReleaseJob(ctx context.Context, jobId string) bool {
 }
 
 func (db *SqliteBatchQ) GetProxyJobs(ctx context.Context) []*jobs.JobDef {
+	unlock, err := db.acquireLock(ctx, false)
+	if err != nil {
+		log.Printf("socketlock read failed (GetProxyJobs): %v", err)
+		return nil
+	}
+	defer unlock()
+
 	conn := db.connect()
 	defer db.close()
 

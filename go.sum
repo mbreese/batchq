@@ -11,6 +11,8 @@ github.com/mbreese/iniconfig v0.0.3 h1:xFxL2MC0KaWCjwhCFQpxyb1Y2w8fiVMZhTTP53w/F
 github.com/mbreese/iniconfig v0.0.3/go.mod h1:OuoBTV/zsc+64+lHG9bPPji3R5rIeoabIJUEOuVSZvQ=
 github.com/mbreese/iniconfig v0.0.4 h1:tc9uvu+6qHIP7UmBmUMHNafspc0qEEPvrbGmSCMUcbM=
 github.com/mbreese/iniconfig v0.0.4/go.mod h1:OuoBTV/zsc+64+lHG9bPPji3R5rIeoabIJUEOuVSZvQ=
+github.com/mbreese/socketlock v0.0.0-20260205084203-8200b85dfddf h1:UQq8gmitKLLfkdmwgbdQ/Nw1ThfR4aE5sAVMSrf8yd4=
+github.com/mbreese/socketlock v0.0.0-20260205084203-8200b85dfddf/go.mod h1:0abaD7CqEmItILUS+QxspnAuGuecHVaPqtJcoYKJJoI=
 github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
 github.com/spf13/cobra v1.9.1 h1:CXSaggrXdbHK9CF+8ywj8Amf7PBRmPCOJugH954Nnlo=
 github.com/spf13/cobra v1.9.1/go.mod h1:nDyEzZ8ogv936Cinf6g1RU9MRY64Ir93oCnqb9wxYW0=

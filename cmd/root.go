@@ -38,6 +38,7 @@ var debugCmd = &cobra.Command{
 		fmt.Printf("batchq home: %s\n", batchqHome)
 		fmt.Printf("     config: %s\n", configFile)
 		fmt.Printf("     dbpath: %s\n", dbpath)
+		fmt.Printf("lock socket: %s\n", lockSocket)
 
 	},
 }
@@ -60,6 +61,7 @@ func SetLicenseText(txt string) {
 var batchqHome string
 var configFile string
 var dbpath string
+var lockSocket string
 var force bool
 
 func init() {
@@ -71,12 +73,17 @@ func init() {
 	rootCmd.AddCommand(licenseCmd)
 	rootCmd.AddCommand(initdbCmd)
 
-	batchqHome := iniconfig.GetBatchqHome()
+	batchqHome = iniconfig.GetBatchqHome()
 	var err error
 	if configFile, err = support.ExpandPathAbs(filepath.Join(batchqHome, "config")); err == nil {
 		Config = iniconfig.LoadConfig(configFile, "batchq")
 		defDB, _ := support.ExpandPathAbs(filepath.Join(batchqHome, "batchq.db"))
 		dbpath, _ = Config.Get("", "dbpath", "sqlite3://"+defDB) // ok is always true with a defval
+		defLock, _ := support.ExpandPathAbs(filepath.Join(batchqHome, "lock.sock"))
+		lockSocket, _ = Config.Get("", "lock_socket", defLock)
+		if err := db.SetSocketLockPath(lockSocket); err != nil {
+			fmt.Printf("Warning: invalid lock_socket %q: %v\n", lockSocket, err)
+		}
 	}
 }
 
