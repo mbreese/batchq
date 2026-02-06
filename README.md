@@ -92,6 +92,7 @@ Example `~/.batchq/config`:
 [batchq]
 runner = simple            # or slurm
 dbpath = sqlite3:///path/to/batchq.db
+lock_socket = ~/.batchq/lock.sock
 
 [job_defaults]
 procs = 4
