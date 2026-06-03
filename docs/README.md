@@ -43,7 +43,10 @@ These pages cover how batchq is put together and how to deploy and use it.
 - [SLURM](slurm.md) — running batchq on top of a SLURM cluster, including
   the head-node split between the batchq server and the SLURM runner.
 - [Remote access](remote.md) — exposing a batchq server to remote clients
-  via a reverse proxy, with HTTPS and (eventually) bearer-token auth.
+  via a reverse proxy, with HTTPS and bearer-token auth.
+- [Tenants and tokens](tenants.md) — operator guide for the multi-tenant
+  remote-server case: `batchq tenant create`, `batchq token mint`, the
+  master key, and the threat model.
 
 ## A note on the README
 

@@ -70,8 +70,16 @@ captured stdout/stderr paths, resource requirements (procs, memory,
 walltime), and optional metadata (name, environment, dependencies).
 Every job has a UUID job ID with hyphens.
 
-**Queue.** The single ordered list of jobs the server owns. There is no
-notion of multiple named queues — one batchq instance has one queue.
+**Queue.** The ordered list of jobs the server owns. There are no named
+queues, but a server can host multiple **tenants** — see below — each
+with their own isolated queue.
+
+**Tenant.** A logical queue owner. On a single-user workstation this
+is invisible: the server lazily creates an implicit local tenant for
+your unix uid on first contact, and your queue is just "yours". On a
+multi-user remote server, an operator creates explicit tenants and
+mints bearer tokens for them; each user sees only their own tenant's
+queue. See [tenants and tokens](tenants.md) for the operator workflow.
 
 **Server.** The `batchq server` process. It owns the SQLite database
 file and serves the REST API over a unix socket. Exactly one server

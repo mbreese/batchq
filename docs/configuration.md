@@ -98,6 +98,12 @@ Ignored entirely when `[batchq] remote` is set (no local server runs).
 | `idle_timeout` | duration | (unset, no shutdown) | If non-zero, the server shuts down after this duration of no requests. Autospawned servers use a built-in `1m` value. |
 | `sqlite_wal` | bool | `false` | Opt into SQLite WAL journaling. Off by default because WAL's `-shm` shared-memory file is unsafe on NFS/Lustre. Only enable when the DB file is on local disk. |
 
+The bearer-token signing secret lives at `$BATCHQ_HOME/master.key`
+(mode `0600`, auto-created on first start; the server refuses to
+start if existing perms are wider). The path is not currently
+configurable — symlink if you need the key on a different volume.
+See [tenants and tokens](tenants.md) for the full lifecycle.
+
 ## `[web]` — `batchq web` listener
 
 | Key | Type | Default | Meaning |

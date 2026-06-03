@@ -159,32 +159,58 @@ nginx setup above.
 
 ## Authentication
 
-batchq has the plumbing for bearer-token auth on the client side
-already. The flag is `--token`, the env var is `BATCHQ_TOKEN`, and the
-config knob is `[batchq] token`. The client sends an `Authorization:
-Bearer <token>` header on every request.
+batchq has full bearer-token authentication for remote clients. The
+client side is unchanged: `--token`, `BATCHQ_TOKEN`, or `[batchq]
+token` in config. The client sends `Authorization: Bearer <token>`
+on every HTTPS request.
 
-**The server side is not yet implemented.** Tokens are HMAC-signed
-against a `$BATCHQ_HOME/master.key`, but the server does not yet
-validate them. Until that lands, you must gate access at the proxy
-layer:
+The server side validates each incoming token by recomputing its
+HMAC-SHA256 against `$BATCHQ_HOME/master.key` and looking the result
+up in the tokens table. The master key file is created with mode
+`0600` on first start and the server refuses to use it if the
+permissions are wider. Lost master key means every existing token
+becomes invalid — the operator re-mints. There is no decryption
+step; just an HMAC comparison.
 
-- IP allow-lists on the proxy.
-- A second authentication layer in front (mTLS, basic auth, OAuth
-  proxy, a corporate identity provider).
-- VPN-only access to the proxy.
+batchq is multi-tenant: every token belongs to a tenant, and the
+server scopes every request to that tenant. Two users with different
+tokens see two completely separate queues, even if they hit the
+same server. See [tenants](tenants.md) for the operator workflow
+(`batchq tenant create`, `batchq token mint`, etc.).
 
-Pick whatever fits your security posture. Do not expose a batchq
-server to the open internet without one of these in place.
+### Tenant onboarding flow
 
-When server-side token validation lands, the recommended workflow will
-be:
+1. **Operator creates a tenant on the server host:**
+   ```sh
+   batchq tenant create alice
+   ```
+2. **Operator mints a token for that tenant:**
+   ```sh
+   batchq token mint --tenant alice --label "alice's laptop" --expires-in 720h
+   ```
+   The CLI prints the token to stdout exactly once — the server only
+   stores its HMAC, so it cannot reprint. Operator distributes
+   out-of-band (password manager, encrypted DM).
+3. **User configures the client:**
+   ```sh
+   export BATCHQ_TOKEN=batchq_pat_…
+   batchq submit --remote https://batchq.example.com ./job.sh
+   ```
+4. **Revocation** is `batchq token revoke <token-id>`; the next
+   request using that token returns 401.
 
-1. Server generates `master.key` (mode `0600`) at startup.
-2. An operator uses a (future) `batchq token mint` to produce tokens
-   for users.
-3. Users put the token in `BATCHQ_TOKEN` and the client sends it.
-4. The server validates the token's HMAC against `master.key`.
+The CLI commands run on the server host because they touch the
+storage and master key directly. They are not exposed over the REST
+API in v1.
+
+### What if the proxy still needs to gate access?
+
+Reverse-proxy-level gating is still a good idea — defense in depth.
+The bearer-token check happens server-side after the proxy already
+saw the request; an IP allow-list, a corporate IdP, or VPN-only
+access in front of the proxy reduces the surface for credential
+guessing and rate-limiting headaches. Use the same proxy
+configuration you would have used before bearer tokens landed.
 
 ## Operational notes
 
