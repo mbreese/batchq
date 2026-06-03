@@ -81,10 +81,11 @@ type Server struct {
 	// means our socket path now leads to a different process.
 	instanceID string
 
-	// defaultTenantID is the implicit local tenant injected into every
-	// request context until the real auth middleware (Phase 2) replaces
-	// this stub. Populated in New() via EnsureLocalTenant.
-	defaultTenantID string
+	// auth resolves each incoming request to a tenant. Phase 2:
+	// peer-cred uid -> per-uid implicit local tenant, otherwise
+	// shared "_local" fallback. Phase 3 will add bearer-token
+	// validation in front of the fallback.
+	auth *authResolver
 
 	httpSrv *http.Server
 
@@ -123,21 +124,16 @@ func New(svc *service.Service, opts Options) (*Server, error) {
 		opts.OwnershipCheckInterval = 30 * time.Second
 	}
 
-	// Ensure the implicit local tenant exists so single-user
-	// deployments work out of the box. This is the Phase 1 stub for
-	// what auth middleware will do per-request in Phase 2: provision
-	// a tenant for whichever uid is connecting. With only one local
-	// tenant today, the same ID is injected into every request.
-	tenant, err := svc.Store().EnsureLocalTenant(context.Background(), "_local")
+	auth, err := newAuthResolver(context.Background(), svc)
 	if err != nil {
-		return nil, fmt.Errorf("server: ensure local tenant: %w", err)
+		return nil, err
 	}
 
 	s := &Server{
-		svc:             svc,
-		opts:            opts,
-		instanceID:      support.NewUUID(),
-		defaultTenantID: tenant.ID,
+		svc:        svc,
+		opts:       opts,
+		instanceID: support.NewUUID(),
+		auth:       auth,
 	}
 	mux := s.routes()
 	s.httpSrv = &http.Server{
@@ -359,21 +355,7 @@ func (s *Server) routes() http.Handler {
 
 	mux.HandleFunc("POST "+p+api.RouteShutdown, s.handleShutdown)
 
-	return s.withVersionHeader(s.withActivity(s.withDefaultTenant(mux)))
-}
-
-// withDefaultTenant is the Phase 1 stub for the real authentication
-// middleware. It unconditionally injects the implicit local tenant ID
-// into the request context so every handler downstream has somebody
-// to attribute the request to. Phase 2 replaces this with a real
-// resolver: peer creds -> per-uid implicit tenant on the unix socket,
-// bearer token -> tenant lookup on HTTPS, 401 if neither.
-func (s *Server) withDefaultTenant(next http.Handler) http.Handler {
-	tenantID := support.TenantID(s.defaultTenantID)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := support.WithTenant(r.Context(), tenantID)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+	return s.withVersionHeader(s.withActivity(s.withAuth(mux)))
 }
 
 // withVersionHeader stamps every response with the API version header so
