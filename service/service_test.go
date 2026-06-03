@@ -9,9 +9,17 @@ import (
 	"github.com/mbreese/batchq/api"
 	"github.com/mbreese/batchq/jobs"
 	"github.com/mbreese/batchq/storage"
+	"github.com/mbreese/batchq/support"
 )
 
-func newService(t *testing.T) *Service {
+// ctxMaker returns a fresh test context that carries the implicit
+// tenant ID set up by newService. Returned from newService alongside
+// the service so test bodies can keep calling ctxT(t) unchanged
+// (just shadowing the package-level helper with a closure that
+// injects the tenant).
+type ctxMaker func(*testing.T) context.Context
+
+func newService(t *testing.T) (*Service, ctxMaker) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "batchq.db")
 	st, err := storage.Open(context.Background(), path, storage.Options{})
@@ -19,21 +27,25 @@ func newService(t *testing.T) *Service {
 		t.Fatalf("storage.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return New(st)
-}
-
-func ctxT(t *testing.T) context.Context {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
-	return ctx
+	tenant, err := st.EnsureLocalTenant(context.Background(), "_test")
+	if err != nil {
+		t.Fatalf("EnsureLocalTenant: %v", err)
+	}
+	tid := support.TenantID(tenant.ID)
+	mk := func(t *testing.T) context.Context {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		t.Cleanup(cancel)
+		return support.WithTenant(ctx, tid)
+	}
+	return New(st), mk
 }
 
 // SubmitJob is the heart of the service: assigns a UUID, persists, and
 // returns a DTO. The wire-level invariant is that the response's job_id is
 // the same UUID the server picked.
 func TestSubmitJobAssignsUUID(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	dto, err := svc.SubmitJob(ctxT(t), &api.SubmitJobRequest{
 		Name:    "hello",
 		Details: map[string]string{"script": "echo hi"},
@@ -53,7 +65,7 @@ func TestSubmitJobAssignsUUID(t *testing.T) {
 }
 
 func TestSubmitJobRejectsMissingScript(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	_, err := svc.SubmitJob(ctxT(t), &api.SubmitJobRequest{Name: "x"})
 	if err == nil {
 		t.Fatal("expected error for missing script")
@@ -61,7 +73,7 @@ func TestSubmitJobRejectsMissingScript(t *testing.T) {
 }
 
 func TestSubmitJobHoldStartsAsUserHold(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	dto, err := svc.SubmitJob(ctxT(t), &api.SubmitJobRequest{
 		Hold:    true,
 		Details: map[string]string{"script": "x"},
@@ -75,7 +87,7 @@ func TestSubmitJobHoldStartsAsUserHold(t *testing.T) {
 }
 
 func TestSubmitJobWithDepGoesWaiting(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	parent, _ := svc.SubmitJob(ctxT(t), &api.SubmitJobRequest{Details: map[string]string{"script": "x"}})
 	child, err := svc.SubmitJob(ctxT(t), &api.SubmitJobRequest{
 		AfterOk: []string{parent.JobID},
@@ -93,7 +105,7 @@ func TestSubmitJobWithDepGoesWaiting(t *testing.T) {
 // remaining dep is this job, without the caller having to invoke
 // ResolveDependencies manually.
 func TestEndJobSuccessAutoPromotesWaiters(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	ctx := ctxT(t)
 
 	parent, _ := svc.SubmitJob(ctx, &api.SubmitJobRequest{Details: map[string]string{"script": "x"}})
@@ -126,7 +138,7 @@ func TestEndJobSuccessAutoPromotesWaiters(t *testing.T) {
 // CleanupJob should refuse to act on a job that is not in a terminal state.
 // This is a service-layer invariant; storage.CleanupJob has no such guard.
 func TestCleanupRefusesNonTerminal(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	dto, _ := svc.SubmitJob(ctxT(t), &api.SubmitJobRequest{Details: map[string]string{"script": "x"}})
 	err := svc.CleanupJob(ctxT(t), dto.JobID)
 	if err == nil {
@@ -135,7 +147,7 @@ func TestCleanupRefusesNonTerminal(t *testing.T) {
 }
 
 func TestCleanupOnTerminalSucceeds(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	ctx := ctxT(t)
 	dto, _ := svc.SubmitJob(ctx, &api.SubmitJobRequest{Details: map[string]string{"script": "x"}})
 	_, _ = svc.ClaimNextJob(ctx, "r", "simple", storage.Limits{})
@@ -149,7 +161,7 @@ func TestCleanupOnTerminalSucceeds(t *testing.T) {
 }
 
 func TestListJobsRoutesByOptions(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	ctx := ctxT(t)
 
 	_, _ = svc.SubmitJob(ctx, &api.SubmitJobRequest{Name: "alpha-job", Details: map[string]string{"script": "x"}})
@@ -181,7 +193,7 @@ func TestListJobsRoutesByOptions(t *testing.T) {
 }
 
 func TestStatusCountsWireFormat(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	_, _ = svc.SubmitJob(ctxT(t), &api.SubmitJobRequest{Details: map[string]string{"script": "x"}})
 
 	counts, err := svc.GetJobStatusCounts(ctxT(t), false)
@@ -264,7 +276,7 @@ func TestParseStatus(t *testing.T) {
 }
 
 func TestListJobsFiltersByRunIDAndFiles(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	ctx := ctxT(t)
 
 	mustSubmit := func(name, runID string, inputs, outputs []string) string {

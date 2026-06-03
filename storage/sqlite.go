@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mbreese/batchq/jobs"
+	"github.com/mbreese/batchq/support"
 
 	_ "modernc.org/sqlite"
 )
@@ -151,9 +152,117 @@ func parseTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("storage: cannot parse time %q", s)
 }
 
+// --- Tenants -----------------------------------------------------------
+
+func scanTenant(sc scanner) (*Tenant, error) {
+	var t Tenant
+	var created string
+	if err := sc.Scan(&t.ID, &t.Name, &t.Kind, &created); err != nil {
+		return nil, err
+	}
+	var err error
+	if t.CreatedAt, err = parseTime(created); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+func (s *sqliteStorage) CreateTenant(ctx context.Context, name string, kind TenantKind) (*Tenant, error) {
+	if name == "" {
+		return nil, errors.New("storage: empty tenant name")
+	}
+	if kind != TenantKindLocal && kind != TenantKindRemote {
+		return nil, fmt.Errorf("storage: invalid tenant kind %q", kind)
+	}
+	id := support.NewUUID()
+	created := nowString()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO tenants (id, name, kind, created_at) VALUES (?, ?, ?, ?)`,
+		id, name, string(kind), created)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrTenantExists
+		}
+		return nil, fmt.Errorf("storage: create tenant: %w", err)
+	}
+	createdAt, _ := parseTime(created)
+	return &Tenant{ID: id, Name: name, Kind: kind, CreatedAt: createdAt}, nil
+}
+
+func (s *sqliteStorage) GetTenantByName(ctx context.Context, name string) (*Tenant, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, name, kind, created_at FROM tenants WHERE name = ?`, name)
+	t, err := scanTenant(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrTenantNotFound
+		}
+		return nil, err
+	}
+	return t, nil
+}
+
+func (s *sqliteStorage) GetTenantByID(ctx context.Context, id string) (*Tenant, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, name, kind, created_at FROM tenants WHERE id = ?`, id)
+	t, err := scanTenant(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrTenantNotFound
+		}
+		return nil, err
+	}
+	return t, nil
+}
+
+func (s *sqliteStorage) ListTenants(ctx context.Context) ([]*Tenant, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, kind, created_at FROM tenants ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Tenant
+	for rows.Next() {
+		t, err := scanTenant(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// EnsureLocalTenant returns the local tenant named name, creating it
+// with kind=local if it does not exist. The narrow race where two
+// concurrent callers both decide to create the same tenant is resolved
+// by the UNIQUE constraint on name — the loser re-fetches.
+func (s *sqliteStorage) EnsureLocalTenant(ctx context.Context, name string) (*Tenant, error) {
+	if name == "" {
+		return nil, errors.New("storage: empty tenant name")
+	}
+	if t, err := s.GetTenantByName(ctx, name); err == nil {
+		return t, nil
+	} else if !errors.Is(err, ErrTenantNotFound) {
+		return nil, err
+	}
+	t, err := s.CreateTenant(ctx, name, TenantKindLocal)
+	if err == nil {
+		return t, nil
+	}
+	if !errors.Is(err, ErrTenantExists) {
+		return nil, err
+	}
+	// Lost the race; the other caller created it. Re-fetch.
+	return s.GetTenantByName(ctx, name)
+}
+
 // --- Submission ---------------------------------------------------------
 
-func (s *sqliteStorage) InsertJob(ctx context.Context, job *jobs.JobDef) error {
+func (s *sqliteStorage) InsertJob(ctx context.Context, tenantID string, job *jobs.JobDef) error {
+	if tenantID == "" {
+		return errors.New("storage: empty tenantID")
+	}
 	if job == nil {
 		return errors.New("storage: nil job")
 	}
@@ -161,9 +270,10 @@ func (s *sqliteStorage) InsertJob(ctx context.Context, job *jobs.JobDef) error {
 		return errors.New("storage: job missing id")
 	}
 
-	// Validate dependencies before any writes.
+	// Validate dependencies before any writes. Deps must live in the
+	// same tenant (GetJob's tenant-scoped lookup enforces that).
 	for _, depID := range job.AfterOk {
-		dep, err := s.GetJob(ctx, depID)
+		dep, err := s.GetJob(ctx, tenantID, depID)
 		if err != nil {
 			return fmt.Errorf("storage: dep %s: %w", depID, err)
 		}
@@ -200,9 +310,9 @@ func (s *sqliteStorage) InsertJob(ctx context.Context, job *jobs.JobDef) error {
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO jobs (id, status, priority, name, notes, submit_time)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		job.JobId, status, job.Priority, name, job.Notes, submitTime,
+		`INSERT INTO jobs (id, tenant_id, status, priority, name, notes, submit_time)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		job.JobId, tenantID, status, job.Priority, name, job.Notes, submitTime,
 	); err != nil {
 		return fmt.Errorf("storage: insert job: %w", err)
 	}
@@ -259,8 +369,8 @@ func (s *sqliteStorage) InsertJob(ctx context.Context, job *jobs.JobDef) error {
 
 // --- Read access --------------------------------------------------------
 
-func (s *sqliteStorage) GetJob(ctx context.Context, jobID string) (*jobs.JobDef, error) {
-	job, err := s.fetchJob(ctx, jobID)
+func (s *sqliteStorage) GetJob(ctx context.Context, tenantID, jobID string) (*jobs.JobDef, error) {
+	job, err := s.fetchJob(ctx, tenantID, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -270,10 +380,10 @@ func (s *sqliteStorage) GetJob(ctx context.Context, jobID string) (*jobs.JobDef,
 	return job, nil
 }
 
-func (s *sqliteStorage) fetchJob(ctx context.Context, jobID string) (*jobs.JobDef, error) {
+func (s *sqliteStorage) fetchJob(ctx context.Context, tenantID, jobID string) (*jobs.JobDef, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, status, priority, name, notes, submit_time, start_time, end_time, return_code
-		 FROM jobs WHERE id = ?`, jobID)
+		 FROM jobs WHERE id = ? AND tenant_id = ?`, jobID, tenantID)
 	job, err := scanJob(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -310,7 +420,10 @@ func scanJob(sc scanner) (*jobs.JobDef, error) {
 }
 
 // loadJobRelations populates AfterOk, Details, RunningDetails, and the
-// input/output file lists for a job.
+// input/output file lists for a job. These are scoped by job_id only;
+// tenant scoping is enforced at the parent fetchJob/queryJobs boundary
+// so the caller can trust this populates only its own tenant's job's
+// relations.
 func (s *sqliteStorage) loadJobRelations(ctx context.Context, job *jobs.JobDef) error {
 	deps, err := s.fetchDeps(ctx, job.JobId)
 	if err != nil {
@@ -444,40 +557,43 @@ func (s *sqliteStorage) fetchRunningDetails(ctx context.Context, jobID string) (
 	return details, rows.Err()
 }
 
-func (s *sqliteStorage) ListJobs(ctx context.Context, showAll, sortByStatus bool) ([]*jobs.JobDef, error) {
+func (s *sqliteStorage) ListJobs(ctx context.Context, tenantID string, showAll, sortByStatus bool) ([]*jobs.JobDef, error) {
 	var query string
-	var args []any
+	args := []any{tenantID}
 	switch {
 	case showAll && sortByStatus:
 		query = `SELECT id, status, priority, name, notes, submit_time, start_time, end_time, return_code
-		         FROM jobs ORDER BY status DESC, priority DESC, end_time, start_time, id`
+		         FROM jobs WHERE tenant_id = ?
+		         ORDER BY status DESC, priority DESC, end_time, start_time, id`
 	case showAll && !sortByStatus:
 		query = `SELECT id, status, priority, name, notes, submit_time, start_time, end_time, return_code
-		         FROM jobs ORDER BY id`
+		         FROM jobs WHERE tenant_id = ? ORDER BY id`
 	case !showAll && sortByStatus:
 		query = `SELECT id, status, priority, name, notes, submit_time, start_time, end_time, return_code
-		         FROM jobs WHERE status <= ? ORDER BY status DESC, priority DESC, end_time, start_time, id`
-		args = []any{jobs.RUNNING}
+		         FROM jobs WHERE tenant_id = ? AND status <= ?
+		         ORDER BY status DESC, priority DESC, end_time, start_time, id`
+		args = append(args, jobs.RUNNING)
 	default:
 		query = `SELECT id, status, priority, name, notes, submit_time, start_time, end_time, return_code
-		         FROM jobs WHERE status <= ? ORDER BY id`
-		args = []any{jobs.RUNNING}
+		         FROM jobs WHERE tenant_id = ? AND status <= ? ORDER BY id`
+		args = append(args, jobs.RUNNING)
 	}
 	return s.queryJobs(ctx, query, args, true)
 }
 
-func (s *sqliteStorage) ListJobsByStatus(ctx context.Context, statuses []jobs.StatusCode, sortByStatus bool) ([]*jobs.JobDef, error) {
+func (s *sqliteStorage) ListJobsByStatus(ctx context.Context, tenantID string, statuses []jobs.StatusCode, sortByStatus bool) ([]*jobs.JobDef, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
 	placeholders := make([]string, len(statuses))
-	args := make([]any, len(statuses))
+	args := make([]any, 0, len(statuses)+1)
+	args = append(args, tenantID)
 	for i, st := range statuses {
 		placeholders[i] = "?"
-		args[i] = st
+		args = append(args, st)
 	}
 	query := `SELECT id, status, priority, name, notes, submit_time, start_time, end_time, return_code
-	          FROM jobs WHERE status IN (` + strings.Join(placeholders, ",") + `)`
+	          FROM jobs WHERE tenant_id = ? AND status IN (` + strings.Join(placeholders, ",") + `)`
 	if sortByStatus {
 		query += ` ORDER BY status DESC, priority DESC, end_time, start_time, id`
 	} else {
@@ -489,7 +605,7 @@ func (s *sqliteStorage) ListJobsByStatus(ctx context.Context, statuses []jobs.St
 	return s.queryJobs(ctx, query, args, true)
 }
 
-func (s *sqliteStorage) SearchJobs(ctx context.Context, query string, statuses []jobs.StatusCode) ([]*jobs.JobDef, error) {
+func (s *sqliteStorage) SearchJobs(ctx context.Context, tenantID, query string, statuses []jobs.StatusCode) ([]*jobs.JobDef, error) {
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" {
 		return nil, nil
@@ -498,7 +614,7 @@ func (s *sqliteStorage) SearchJobs(ctx context.Context, query string, statuses [
 	sqlQuery := `
 		SELECT j.id, j.status, j.priority, j.name, j.notes, j.submit_time, j.start_time, j.end_time, j.return_code
 		FROM jobs j
-		WHERE (
+		WHERE j.tenant_id = ? AND (
 			j.id LIKE ?
 			OR j.name LIKE ?
 			OR EXISTS (
@@ -518,7 +634,7 @@ func (s *sqliteStorage) SearchJobs(ctx context.Context, query string, statuses [
 				WHERE o.job_id = j.id AND o.path LIKE ?
 			)
 		)`
-	args := []any{like, like, like, like, like, like}
+	args := []any{tenantID, like, like, like, like, like, like}
 	if len(statuses) > 0 {
 		placeholders := make([]string, len(statuses))
 		for i, st := range statuses {
@@ -564,9 +680,17 @@ func (s *sqliteStorage) queryJobs(ctx context.Context, query string, args []any,
 	return out, nil
 }
 
-func (s *sqliteStorage) GetJobDependents(ctx context.Context, jobID string) ([]string, error) {
+func (s *sqliteStorage) GetJobDependents(ctx context.Context, tenantID, jobID string) ([]string, error) {
+	// Verify the parent itself belongs to this tenant; otherwise we'd
+	// leak existence by returning an empty list for somebody else's job.
+	if _, err := s.fetchJob(ctx, tenantID, jobID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT job_id FROM job_deps WHERE afterok_id = ? ORDER BY job_id`, jobID)
+		`SELECT d.job_id FROM job_deps d
+		 JOIN jobs j ON j.id = d.job_id
+		 WHERE d.afterok_id = ? AND j.tenant_id = ?
+		 ORDER BY d.job_id`, jobID, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -582,7 +706,7 @@ func (s *sqliteStorage) GetJobDependents(ctx context.Context, jobID string) ([]s
 	return out, rows.Err()
 }
 
-func (s *sqliteStorage) GetJobStatusCounts(ctx context.Context, showAll bool) (map[jobs.StatusCode]int, error) {
+func (s *sqliteStorage) GetJobStatusCounts(ctx context.Context, tenantID string, showAll bool) (map[jobs.StatusCode]int, error) {
 	counts := map[jobs.StatusCode]int{
 		jobs.USERHOLD:    0,
 		jobs.WAITING:     0,
@@ -593,10 +717,10 @@ func (s *sqliteStorage) GetJobStatusCounts(ctx context.Context, showAll bool) (m
 		jobs.FAILED:      0,
 		jobs.CANCELED:    0,
 	}
-	query := `SELECT status, COUNT(*) FROM jobs`
-	var args []any
+	query := `SELECT status, COUNT(*) FROM jobs WHERE tenant_id = ?`
+	args := []any{tenantID}
 	if !showAll {
-		query += ` WHERE status <= ?`
+		query += ` AND status <= ?`
 		args = append(args, jobs.RUNNING)
 	}
 	query += ` GROUP BY status`
@@ -617,7 +741,7 @@ func (s *sqliteStorage) GetJobStatusCounts(ctx context.Context, showAll bool) (m
 	return counts, rows.Err()
 }
 
-func (s *sqliteStorage) GetQueueJobs(ctx context.Context, showAll, sortByStatus bool) ([]*jobs.JobDef, error) {
+func (s *sqliteStorage) GetQueueJobs(ctx context.Context, tenantID string, showAll, sortByStatus bool) ([]*jobs.JobDef, error) {
 	// Single-query version that pulls only the small subset of details the
 	// queue view cares about. Falls back to ListJobs / ListJobsByStatus if
 	// the fast query somehow returns zero rows but there are jobs in the DB
@@ -643,11 +767,12 @@ func (s *sqliteStorage) GetQueueJobs(ctx context.Context, showAll, sortByStatus 
 			WHERE key IN ('pid', 'slurm_status', 'slurm_job_id')
 			GROUP BY job_id
 		) running ON running.job_id = j.id
+		WHERE j.tenant_id = ?
 	`
-	var args []any
+	args := []any{tenantID}
 	if !showAll {
-		query += ` WHERE j.status IN (?, ?, ?, ?)`
-		args = []any{jobs.WAITING, jobs.QUEUED, jobs.PROXYQUEUED, jobs.RUNNING}
+		query += ` AND j.status IN (?, ?, ?, ?)`
+		args = append(args, jobs.WAITING, jobs.QUEUED, jobs.PROXYQUEUED, jobs.RUNNING)
 	}
 	if sortByStatus {
 		query += ` ORDER BY j.status DESC, j.priority DESC, j.end_time, j.start_time, j.id`
@@ -721,26 +846,26 @@ func parseConcatKV[T any](raw string, mk func(k, v string) T) []T {
 	return out
 }
 
-func (s *sqliteStorage) GetProxyJobs(ctx context.Context) ([]*jobs.JobDef, error) {
+func (s *sqliteStorage) GetProxyJobs(ctx context.Context, tenantID string) ([]*jobs.JobDef, error) {
 	return s.queryJobs(ctx,
 		`SELECT id, status, priority, name, notes, submit_time, start_time, end_time, return_code
-		 FROM jobs WHERE status = ? ORDER BY id`,
-		[]any{jobs.PROXYQUEUED}, true)
+		 FROM jobs WHERE tenant_id = ? AND status = ? ORDER BY id`,
+		[]any{tenantID, jobs.PROXYQUEUED}, true)
 }
 
 // --- Dependency resolution ---------------------------------------------
 
-func (s *sqliteStorage) ResolveDependencies(ctx context.Context) (ResolveResult, error) {
+func (s *sqliteStorage) ResolveDependencies(ctx context.Context, tenantID string) (ResolveResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ResolveResult{}, err
 	}
 	defer tx.Rollback()
 
-	// Find all jobs that are WAITING or UNKNOWN.
+	// Find all jobs in this tenant that are WAITING or UNKNOWN.
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM jobs WHERE status = ? OR status = ?`,
-		jobs.WAITING, jobs.UNKNOWN)
+		`SELECT id FROM jobs WHERE tenant_id = ? AND (status = ? OR status = ?)`,
+		tenantID, jobs.WAITING, jobs.UNKNOWN)
 	if err != nil {
 		return ResolveResult{}, err
 	}
@@ -761,10 +886,13 @@ func (s *sqliteStorage) ResolveDependencies(ctx context.Context) (ResolveResult,
 	res := ResolveResult{}
 	for _, jobID := range candidates {
 		// Look up the deps for this job and the status of each parent.
+		// Parents are scoped to the same tenant (a dep that somehow
+		// references a different tenant would be unreachable here and
+		// not affect the can-queue decision).
 		depRows, err := tx.QueryContext(ctx,
 			`SELECT j.id, j.status FROM job_deps d
 			 JOIN jobs j ON j.id = d.afterok_id
-			 WHERE d.job_id = ?`, jobID)
+			 WHERE d.job_id = ? AND j.tenant_id = ?`, jobID, tenantID)
 		if err != nil {
 			return ResolveResult{}, err
 		}
@@ -801,16 +929,16 @@ func (s *sqliteStorage) ResolveDependencies(ctx context.Context) (ResolveResult,
 		case shouldCancel:
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE jobs SET status = ?, notes = ?, end_time = ?
-				 WHERE id = ? AND status IN (?, ?)`,
+				 WHERE id = ? AND tenant_id = ? AND status IN (?, ?)`,
 				jobs.CANCELED, cancelReason+" failed/canceled", nowString(),
-				jobID, jobs.WAITING, jobs.UNKNOWN); err != nil {
+				jobID, tenantID, jobs.WAITING, jobs.UNKNOWN); err != nil {
 				return ResolveResult{}, err
 			}
 			res.Canceled++
 		case canQueue:
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE jobs SET status = ? WHERE id = ? AND status IN (?, ?)`,
-				jobs.QUEUED, jobID, jobs.WAITING, jobs.UNKNOWN); err != nil {
+				`UPDATE jobs SET status = ? WHERE id = ? AND tenant_id = ? AND status IN (?, ?)`,
+				jobs.QUEUED, jobID, tenantID, jobs.WAITING, jobs.UNKNOWN); err != nil {
 				return ResolveResult{}, err
 			}
 			res.Promoted++
@@ -825,7 +953,10 @@ func (s *sqliteStorage) ResolveDependencies(ctx context.Context) (ResolveResult,
 
 // --- Atomic claim ------------------------------------------------------
 
-func (s *sqliteStorage) ClaimNextJob(ctx context.Context, runnerID, kind string, limits Limits) (ClaimResult, error) {
+func (s *sqliteStorage) ClaimNextJob(ctx context.Context, tenantID, runnerID, kind string, limits Limits) (ClaimResult, error) {
+	if tenantID == "" {
+		return ClaimResult{}, errors.New("storage: empty tenantID")
+	}
 	if runnerID == "" {
 		return ClaimResult{}, errors.New("storage: empty runnerID")
 	}
@@ -836,8 +967,8 @@ func (s *sqliteStorage) ClaimNextJob(ctx context.Context, runnerID, kind string,
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM jobs WHERE status = ? ORDER BY priority DESC, submit_time, id`,
-		jobs.QUEUED)
+		`SELECT id FROM jobs WHERE tenant_id = ? AND status = ? ORDER BY priority DESC, submit_time, id`,
+		tenantID, jobs.QUEUED)
 	if err != nil {
 		return ClaimResult{}, err
 	}
@@ -879,13 +1010,13 @@ func (s *sqliteStorage) ClaimNextJob(ctx context.Context, runnerID, kind string,
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE jobs SET status = ?, start_time = ?
-			 WHERE id = ? AND status = ?`,
-			jobs.RUNNING, nowString(), jobID, jobs.QUEUED); err != nil {
+			 WHERE id = ? AND tenant_id = ? AND status = ?`,
+			jobs.RUNNING, nowString(), jobID, tenantID, jobs.QUEUED); err != nil {
 			return ClaimResult{}, err
 		}
 		// Load the job inside the transaction so the caller sees the
 		// post-claim state.
-		job, err := s.txGetJob(ctx, tx, jobID)
+		job, err := s.txGetJob(ctx, tx, tenantID, jobID)
 		if err != nil {
 			return ClaimResult{}, err
 		}
@@ -905,7 +1036,6 @@ func (s *sqliteStorage) ClaimNextJob(ctx context.Context, runnerID, kind string,
 // details that fit the supplied limits. Missing details are treated as 0 (no
 // requirement). Limit values <= 0 mean "no cap on this dimension".
 func jobFitsLimits(ctx context.Context, tx *sql.Tx, jobID string, limits Limits) (bool, error) {
-	keys := []string{"procs", "mem", "walltime"}
 	vals := map[string]int{}
 	rows, err := tx.QueryContext(ctx,
 		`SELECT key, value FROM job_details
@@ -927,7 +1057,6 @@ func jobFitsLimits(ctx context.Context, tx *sql.Tx, jobID string, limits Limits)
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	_ = keys
 	if limits.MaxProcs > 0 && vals["procs"] > limits.MaxProcs {
 		return false, nil
 	}
@@ -955,10 +1084,10 @@ func isUniqueViolation(err error) bool {
 }
 
 // txGetJob loads a job and its relations inside an open transaction.
-func (s *sqliteStorage) txGetJob(ctx context.Context, tx *sql.Tx, jobID string) (*jobs.JobDef, error) {
+func (s *sqliteStorage) txGetJob(ctx context.Context, tx *sql.Tx, tenantID, jobID string) (*jobs.JobDef, error) {
 	row := tx.QueryRowContext(ctx,
 		`SELECT id, status, priority, name, notes, submit_time, start_time, end_time, return_code
-		 FROM jobs WHERE id = ?`, jobID)
+		 FROM jobs WHERE id = ? AND tenant_id = ?`, jobID, tenantID)
 	job, err := scanJob(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1017,20 +1146,23 @@ func (s *sqliteStorage) txGetJob(ctx context.Context, tx *sql.Tx, jobID string) 
 
 // --- State transitions -------------------------------------------------
 
-func (s *sqliteStorage) MarkJobProxied(ctx context.Context, jobID, runnerID string, runningDetails map[string]string) error {
+func (s *sqliteStorage) MarkJobProxied(ctx context.Context, tenantID, jobID, runnerID string, runningDetails map[string]string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
+	if err := assertJobInTenant(ctx, tx, tenantID, jobID); err != nil {
+		return err
+	}
 	if err := assertRunnerOwnsJob(ctx, tx, jobID, runnerID); err != nil {
 		return err
 	}
 
 	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET status = ? WHERE id = ? AND status = ?`,
-		jobs.PROXYQUEUED, jobID, jobs.RUNNING)
+		`UPDATE jobs SET status = ? WHERE id = ? AND tenant_id = ? AND status = ?`,
+		jobs.PROXYQUEUED, jobID, tenantID, jobs.RUNNING)
 	if err != nil {
 		return err
 	}
@@ -1049,7 +1181,7 @@ func (s *sqliteStorage) MarkJobProxied(ctx context.Context, jobID, runnerID stri
 	return tx.Commit()
 }
 
-func (s *sqliteStorage) UpdateRunningDetails(ctx context.Context, jobID string, details map[string]string) error {
+func (s *sqliteStorage) UpdateRunningDetails(ctx context.Context, tenantID, jobID string, details map[string]string) error {
 	if len(details) == 0 {
 		return nil
 	}
@@ -1058,6 +1190,9 @@ func (s *sqliteStorage) UpdateRunningDetails(ctx context.Context, jobID string, 
 		return err
 	}
 	defer tx.Rollback()
+	if err := assertJobInTenant(ctx, tx, tenantID, jobID); err != nil {
+		return err
+	}
 	for k, v := range details {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO job_running_details (job_id, key, value)
@@ -1068,13 +1203,16 @@ func (s *sqliteStorage) UpdateRunningDetails(ctx context.Context, jobID string, 
 	return tx.Commit()
 }
 
-func (s *sqliteStorage) EndJob(ctx context.Context, jobID, runnerID string, returnCode int, notes string) error {
+func (s *sqliteStorage) EndJob(ctx context.Context, tenantID, jobID, runnerID string, returnCode int, notes string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
+	if err := assertJobInTenant(ctx, tx, tenantID, jobID); err != nil {
+		return err
+	}
 	if err := assertRunnerOwnsJob(ctx, tx, jobID, runnerID); err != nil {
 		return err
 	}
@@ -1087,8 +1225,8 @@ func (s *sqliteStorage) EndJob(ctx context.Context, jobID, runnerID string, retu
 	res, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET status = ?, end_time = ?, return_code = ?,
 		                 notes = COALESCE(NULLIF(?, ''), notes)
-		 WHERE id = ? AND status = ?`,
-		newStatus, nowString(), returnCode, notes, jobID, jobs.RUNNING)
+		 WHERE id = ? AND tenant_id = ? AND status = ?`,
+		newStatus, nowString(), returnCode, notes, jobID, tenantID, jobs.RUNNING)
 	if err != nil {
 		return err
 	}
@@ -1097,7 +1235,7 @@ func (s *sqliteStorage) EndJob(ctx context.Context, jobID, runnerID string, retu
 	}
 
 	if newStatus != jobs.SUCCESS {
-		if err := cascadeCancel(ctx, tx, jobID,
+		if err := cascadeCancel(ctx, tx, tenantID, jobID,
 			fmt.Sprintf("Parent job %s failed", jobID)); err != nil {
 			return err
 		}
@@ -1106,19 +1244,23 @@ func (s *sqliteStorage) EndJob(ctx context.Context, jobID, runnerID string, retu
 	return tx.Commit()
 }
 
-func (s *sqliteStorage) EndProxiedJob(ctx context.Context, jobID string, status jobs.StatusCode, startTime, endTime time.Time, returnCode int, notes string) error {
+func (s *sqliteStorage) EndProxiedJob(ctx context.Context, tenantID, jobID string, status jobs.StatusCode, startTime, endTime time.Time, returnCode int, notes string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
+	if err := assertJobInTenant(ctx, tx, tenantID, jobID); err != nil {
+		return err
+	}
+
 	res, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET status = ?, start_time = ?, end_time = ?, return_code = ?,
 		                 notes = COALESCE(NULLIF(?, ''), notes)
-		 WHERE id = ? AND status = ?`,
+		 WHERE id = ? AND tenant_id = ? AND status = ?`,
 		status, formatTime(startTime), formatTime(endTime), returnCode, notes,
-		jobID, jobs.PROXYQUEUED)
+		jobID, tenantID, jobs.PROXYQUEUED)
 	if err != nil {
 		return err
 	}
@@ -1127,7 +1269,7 @@ func (s *sqliteStorage) EndProxiedJob(ctx context.Context, jobID string, status 
 	}
 
 	if status != jobs.SUCCESS {
-		if err := cascadeCancel(ctx, tx, jobID,
+		if err := cascadeCancel(ctx, tx, tenantID, jobID,
 			fmt.Sprintf("Parent job %s failed/canceled", jobID)); err != nil {
 			return err
 		}
@@ -1136,28 +1278,29 @@ func (s *sqliteStorage) EndProxiedJob(ctx context.Context, jobID string, status 
 	return tx.Commit()
 }
 
-func (s *sqliteStorage) CancelJob(ctx context.Context, jobID, reason string) error {
+func (s *sqliteStorage) CancelJob(ctx context.Context, tenantID, jobID, reason string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	if err := cancelOne(ctx, tx, jobID, reason); err != nil {
+	if err := cancelOne(ctx, tx, tenantID, jobID, reason); err != nil {
 		return err
 	}
-	if err := cascadeCancel(ctx, tx, jobID, reason); err != nil {
+	if err := cascadeCancel(ctx, tx, tenantID, jobID, reason); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 // cancelOne marks a single job CANCELED (no cascade). No-op if the job is
-// already terminal. Returns ErrJobNotFound if the job doesn't exist; the
-// no-op terminal case returns nil so the caller can drive a cascade through
-// already-terminal parents without error.
-func cancelOne(ctx context.Context, tx *sql.Tx, jobID, reason string) error {
-	row := tx.QueryRowContext(ctx, `SELECT status FROM jobs WHERE id = ?`, jobID)
+// already terminal. Returns ErrJobNotFound if the job doesn't exist in
+// the given tenant; the no-op terminal case returns nil so the caller can
+// drive a cascade through already-terminal parents without error.
+func cancelOne(ctx context.Context, tx *sql.Tx, tenantID, jobID, reason string) error {
+	row := tx.QueryRowContext(ctx,
+		`SELECT status FROM jobs WHERE id = ? AND tenant_id = ?`, jobID, tenantID)
 	var status jobs.StatusCode
 	if err := row.Scan(&status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1170,14 +1313,16 @@ func cancelOne(ctx context.Context, tx *sql.Tx, jobID, reason string) error {
 	}
 	_, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET status = ?, end_time = ?, notes = ?
-		 WHERE id = ? AND status < ?`,
-		jobs.CANCELED, nowString(), reason, jobID, jobs.CANCELED)
+		 WHERE id = ? AND tenant_id = ? AND status < ?`,
+		jobs.CANCELED, nowString(), reason, jobID, tenantID, jobs.CANCELED)
 	return err
 }
 
-// cascadeCancel cancels all jobs that depend (transitively) on parentID,
-// skipping any that are already terminal.
-func cascadeCancel(ctx context.Context, tx *sql.Tx, parentID, reason string) error {
+// cascadeCancel cancels all jobs in the given tenant that depend
+// (transitively) on parentID, skipping any that are already terminal.
+// The tenant scope on the join prevents bleeding across tenants — a
+// stray cross-tenant dep would simply be invisible here.
+func cascadeCancel(ctx context.Context, tx *sql.Tx, tenantID, parentID, reason string) error {
 	// Iterative BFS so we do not blow the stack on deep dep chains.
 	queue := []string{parentID}
 	seen := map[string]bool{parentID: true}
@@ -1187,8 +1332,8 @@ func cascadeCancel(ctx context.Context, tx *sql.Tx, parentID, reason string) err
 		rows, err := tx.QueryContext(ctx,
 			`SELECT d.job_id FROM job_deps d
 			 JOIN jobs j ON j.id = d.job_id
-			 WHERE d.afterok_id = ? AND j.status < ?`,
-			cur, jobs.CANCELED)
+			 WHERE d.afterok_id = ? AND j.tenant_id = ? AND j.status < ?`,
+			cur, tenantID, jobs.CANCELED)
 		if err != nil {
 			return err
 		}
@@ -1209,11 +1354,27 @@ func cascadeCancel(ctx context.Context, tx *sql.Tx, parentID, reason string) err
 			return err
 		}
 		for _, c := range children {
-			if err := cancelOne(ctx, tx, c, reason); err != nil {
+			if err := cancelOne(ctx, tx, tenantID, c, reason); err != nil {
 				return err
 			}
 			queue = append(queue, c)
 		}
+	}
+	return nil
+}
+
+// assertJobInTenant returns ErrJobNotFound if the job doesn't exist or
+// belongs to a different tenant. The two cases are deliberately
+// indistinguishable.
+func assertJobInTenant(ctx context.Context, tx *sql.Tx, tenantID, jobID string) error {
+	var exists int
+	row := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM jobs WHERE id = ? AND tenant_id = ?`, jobID, tenantID)
+	if err := row.Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrJobNotFound
+		}
+		return err
 	}
 	return nil
 }
@@ -1239,10 +1400,10 @@ func assertRunnerOwnsJob(ctx context.Context, tx *sql.Tx, jobID, runnerID string
 
 // --- User actions ------------------------------------------------------
 
-func (s *sqliteStorage) HoldJob(ctx context.Context, jobID string) error {
+func (s *sqliteStorage) HoldJob(ctx context.Context, tenantID, jobID string) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status = ? WHERE id = ? AND status IN (?, ?, ?)`,
-		jobs.USERHOLD, jobID, jobs.QUEUED, jobs.WAITING, jobs.USERHOLD)
+		`UPDATE jobs SET status = ? WHERE id = ? AND tenant_id = ? AND status IN (?, ?, ?)`,
+		jobs.USERHOLD, jobID, tenantID, jobs.QUEUED, jobs.WAITING, jobs.USERHOLD)
 	if err != nil {
 		return err
 	}
@@ -1252,10 +1413,10 @@ func (s *sqliteStorage) HoldJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
-func (s *sqliteStorage) ReleaseJob(ctx context.Context, jobID string) error {
+func (s *sqliteStorage) ReleaseJob(ctx context.Context, tenantID, jobID string) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status = ? WHERE id = ? AND status = ?`,
-		jobs.WAITING, jobID, jobs.USERHOLD)
+		`UPDATE jobs SET status = ? WHERE id = ? AND tenant_id = ? AND status = ?`,
+		jobs.WAITING, jobID, tenantID, jobs.USERHOLD)
 	if err != nil {
 		return err
 	}
@@ -1265,13 +1426,14 @@ func (s *sqliteStorage) ReleaseJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
-func (s *sqliteStorage) AdjustJobPriority(ctx context.Context, jobID string, delta int) error {
+func (s *sqliteStorage) AdjustJobPriority(ctx context.Context, tenantID, jobID string, delta int) error {
 	if delta == 0 {
 		return nil
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET priority = priority + ? WHERE id = ? AND status IN (?, ?, ?)`,
-		delta, jobID, jobs.QUEUED, jobs.WAITING, jobs.USERHOLD)
+		`UPDATE jobs SET priority = priority + ?
+		 WHERE id = ? AND tenant_id = ? AND status IN (?, ?, ?)`,
+		delta, jobID, tenantID, jobs.QUEUED, jobs.WAITING, jobs.USERHOLD)
 	if err != nil {
 		return err
 	}
@@ -1281,12 +1443,15 @@ func (s *sqliteStorage) AdjustJobPriority(ctx context.Context, jobID string, del
 	return nil
 }
 
-func (s *sqliteStorage) CleanupJob(ctx context.Context, jobID string) error {
+func (s *sqliteStorage) CleanupJob(ctx context.Context, tenantID, jobID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if err := assertJobInTenant(ctx, tx, tenantID, jobID); err != nil {
+		return err
+	}
 	stmts := []string{
 		`DELETE FROM job_running_details WHERE job_id = ?`,
 		`DELETE FROM job_running         WHERE job_id = ?`,
@@ -1294,11 +1459,17 @@ func (s *sqliteStorage) CleanupJob(ctx context.Context, jobID string) error {
 		`DELETE FROM job_details         WHERE job_id = ?`,
 		`DELETE FROM job_inputs          WHERE job_id = ?`,
 		`DELETE FROM job_outputs         WHERE job_id = ?`,
-		`DELETE FROM jobs                WHERE id     = ?`,
+		`DELETE FROM jobs                WHERE id     = ? AND tenant_id = ?`,
 	}
-	for _, q := range stmts {
-		if _, err := tx.ExecContext(ctx, q, jobID); err != nil {
-			return err
+	for i, q := range stmts {
+		var execErr error
+		if i == len(stmts)-1 {
+			_, execErr = tx.ExecContext(ctx, q, jobID, tenantID)
+		} else {
+			_, execErr = tx.ExecContext(ctx, q, jobID)
+		}
+		if execErr != nil {
+			return execErr
 		}
 	}
 	return tx.Commit()
@@ -1306,10 +1477,12 @@ func (s *sqliteStorage) CleanupJob(ctx context.Context, jobID string) error {
 
 // --- Reverse lookups for run_id / inputs / outputs --------------------
 
-func (s *sqliteStorage) FindJobsByDetail(ctx context.Context, key, value string) ([]string, error) {
+func (s *sqliteStorage) FindJobsByDetail(ctx context.Context, tenantID, key, value string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT job_id FROM job_details WHERE key = ? AND value = ?`,
-		key, value)
+		`SELECT d.job_id FROM job_details d
+		 JOIN jobs j ON j.id = d.job_id
+		 WHERE j.tenant_id = ? AND d.key = ? AND d.value = ?`,
+		tenantID, key, value)
 	if err != nil {
 		return nil, err
 	}
@@ -1317,9 +1490,11 @@ func (s *sqliteStorage) FindJobsByDetail(ctx context.Context, key, value string)
 	return collectIDs(rows)
 }
 
-func (s *sqliteStorage) FindJobsByInputPath(ctx context.Context, path string) ([]string, error) {
+func (s *sqliteStorage) FindJobsByInputPath(ctx context.Context, tenantID, path string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT job_id FROM job_inputs WHERE path = ?`, path)
+		`SELECT i.job_id FROM job_inputs i
+		 JOIN jobs j ON j.id = i.job_id
+		 WHERE j.tenant_id = ? AND i.path = ?`, tenantID, path)
 	if err != nil {
 		return nil, err
 	}
@@ -1327,9 +1502,11 @@ func (s *sqliteStorage) FindJobsByInputPath(ctx context.Context, path string) ([
 	return collectIDs(rows)
 }
 
-func (s *sqliteStorage) FindJobsByOutputPath(ctx context.Context, path string) ([]string, error) {
+func (s *sqliteStorage) FindJobsByOutputPath(ctx context.Context, tenantID, path string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT job_id FROM job_outputs WHERE path = ?`, path)
+		`SELECT o.job_id FROM job_outputs o
+		 JOIN jobs j ON j.id = o.job_id
+		 WHERE j.tenant_id = ? AND o.path = ?`, tenantID, path)
 	if err != nil {
 		return nil, err
 	}

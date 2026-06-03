@@ -11,10 +11,12 @@ import (
 	"github.com/mbreese/batchq/support"
 )
 
-// ctxWithPeer attaches peer creds to the test's standard context.
-func ctxWithPeer(t *testing.T, uid, gid uint32) context.Context {
+// ctxWithPeer attaches peer creds to a fresh test context built by
+// the given ctxT closure (so the tenant baked in by newService is
+// preserved).
+func ctxWithPeer(t *testing.T, mk ctxMaker, uid, gid uint32) context.Context {
 	t.Helper()
-	return support.WithPeerCreds(ctxT(t), support.PeerCreds{Uid: uid, Gid: gid})
+	return support.WithPeerCreds(mk(t), support.PeerCreds{Uid: uid, Gid: gid})
 }
 
 // fakeNSS installs a stub runCommand that answers the table; anything
@@ -43,9 +45,9 @@ func TestSubmitJob_DerivesIdentityFromPeerCreds(t *testing.T) {
 		"getent passwd 1234": "alice:x:1234:100:Alice:/home/alice:/bin/bash\n",
 		"id -G alice":        "100 4 24 1000\n",
 	})
-	svc := newService(t)
+	svc, ctxT := newService(t)
 
-	ctx := ctxWithPeer(t, 1234, 100)
+	ctx := ctxWithPeer(t, ctxT,1234, 100)
 	dto, err := svc.SubmitJob(ctx, &api.SubmitJobRequest{
 		Details: map[string]string{
 			"script": "echo hi",
@@ -73,7 +75,7 @@ func TestSubmitJob_DerivesIdentityFromPeerCreds(t *testing.T) {
 // preserve today's behavior: client-supplied identity is trusted.
 // This will tighten when bearer-token validation lands.
 func TestSubmitJob_NoPeerCredsPreservesClientIdentity(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	dto, err := svc.SubmitJob(ctxT(t), &api.SubmitJobRequest{
 		Details: map[string]string{
 			"script": "echo hi",
@@ -99,9 +101,9 @@ func TestSubmitJob_NSSUnknownUidStillTrustsPeer(t *testing.T) {
 	t.Cleanup(support.SwapRunCommandForTest(func(name string, args ...string) ([]byte, int, error) {
 		return nil, 2, fmt.Errorf("getent passwd: no entry")
 	}))
-	svc := newService(t)
+	svc, ctxT := newService(t)
 
-	dto, err := svc.SubmitJob(ctxWithPeer(t, 4242, 4242), &api.SubmitJobRequest{
+	dto, err := svc.SubmitJob(ctxWithPeer(t, ctxT,4242, 4242), &api.SubmitJobRequest{
 		Details: map[string]string{"script": "echo", "uid": "9999"},
 	})
 	if err != nil {
@@ -122,13 +124,13 @@ func TestSubmitJob_NSSUnknownUidStillTrustsPeer(t *testing.T) {
 
 // submitAs is a tiny helper that submits a job through a peer-creds
 // context so the resulting job carries kernel-attested ownership.
-func submitAs(t *testing.T, svc *Service, uid, gid uint32) string {
+func submitAs(t *testing.T, svc *Service, mk ctxMaker, uid, gid uint32) string {
 	t.Helper()
 	fakeNSS(t, map[string]string{
 		fmt.Sprintf("getent passwd %d", uid): fmt.Sprintf("u%d:x:%d:%d::/h:/bin/sh\n", uid, uid, gid),
 		fmt.Sprintf("id -G u%d", uid):        fmt.Sprintf("%d\n", gid),
 	})
-	dto, err := svc.SubmitJob(ctxWithPeer(t, uid, gid),
+	dto, err := svc.SubmitJob(ctxWithPeer(t, mk, uid, gid),
 		&api.SubmitJobRequest{Details: map[string]string{"script": "echo"}})
 	if err != nil {
 		t.Fatalf("SubmitJob: %v", err)
@@ -137,10 +139,10 @@ func submitAs(t *testing.T, svc *Service, uid, gid uint32) string {
 }
 
 func TestAuthz_OwnerCanHoldReleaseCancel(t *testing.T) {
-	svc := newService(t)
-	jobID := submitAs(t, svc, 1234, 100)
+	svc, ctxT := newService(t)
+	jobID := submitAs(t, svc, ctxT,1234, 100)
 
-	ctx := ctxWithPeer(t, 1234, 100)
+	ctx := ctxWithPeer(t, ctxT,1234, 100)
 	if err := svc.HoldJob(ctx, jobID); err != nil {
 		t.Fatalf("HoldJob (owner): %v", err)
 	}
@@ -153,10 +155,10 @@ func TestAuthz_OwnerCanHoldReleaseCancel(t *testing.T) {
 }
 
 func TestAuthz_NonOwnerIsForbidden(t *testing.T) {
-	svc := newService(t)
-	jobID := submitAs(t, svc, 1234, 100)
+	svc, ctxT := newService(t)
+	jobID := submitAs(t, svc, ctxT,1234, 100)
 
-	ctx := ctxWithPeer(t, 9999, 9999)
+	ctx := ctxWithPeer(t, ctxT,9999, 9999)
 	for _, op := range []struct {
 		name string
 		fn   func() error
@@ -172,10 +174,10 @@ func TestAuthz_NonOwnerIsForbidden(t *testing.T) {
 }
 
 func TestAuthz_RootBypasses(t *testing.T) {
-	svc := newService(t)
-	jobID := submitAs(t, svc, 1234, 100)
+	svc, ctxT := newService(t)
+	jobID := submitAs(t, svc, ctxT,1234, 100)
 
-	ctx := ctxWithPeer(t, 0, 0)
+	ctx := ctxWithPeer(t, ctxT,0, 0)
 	if err := svc.HoldJob(ctx, jobID); err != nil {
 		t.Fatalf("HoldJob (root): %v", err)
 	}
@@ -190,7 +192,7 @@ func TestAuthz_RootBypasses(t *testing.T) {
 func TestAuthz_NoPeerCredsAllows(t *testing.T) {
 	// No peer creds = remote/proxy client today = allow. Will tighten
 	// once bearer-token validation lands.
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	dto, err := svc.SubmitJob(ctxT(t),
 		&api.SubmitJobRequest{Details: map[string]string{"script": "echo", "uid": "1234", "gid": "100"}})
 	if err != nil {
@@ -205,7 +207,7 @@ func TestAuthz_NoPeerCredsAllows(t *testing.T) {
 // against it under peer-cred enforcement must fail closed; root is
 // the only path through.
 func TestAuthz_JobWithoutUidIsForbiddenForNonRoot(t *testing.T) {
-	svc := newService(t)
+	svc, ctxT := newService(t)
 	// Submit without peer creds so no uid is injected.
 	dto, err := svc.SubmitJob(ctxT(t),
 		&api.SubmitJobRequest{Details: map[string]string{"script": "echo"}})
@@ -217,7 +219,7 @@ func TestAuthz_JobWithoutUidIsForbiddenForNonRoot(t *testing.T) {
 		t.Fatalf("test setup wrong: dto has uid: %+v", dto.Details)
 	}
 
-	err = svc.HoldJob(ctxWithPeer(t, 1234, 100), dto.JobID)
+	err = svc.HoldJob(ctxWithPeer(t, ctxT,1234, 100), dto.JobID)
 	if !errors.Is(err, ErrForbidden) {
 		t.Fatalf("got %v, want ErrForbidden", err)
 	}

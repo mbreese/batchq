@@ -11,9 +11,12 @@ import (
 	"github.com/mbreese/batchq/jobs"
 )
 
-// newTestStore opens a fresh sqlite Storage in a temp directory and registers
-// a Close on test cleanup.
-func newTestStore(t *testing.T) Storage {
+// newTestStore opens a fresh sqlite Storage in a temp directory,
+// creates a "_test" tenant, and returns a wrapper bound to it so test
+// bodies don't have to thread tenantID through every call. Tests
+// that need cross-tenant behavior should reach for the underlying
+// Storage via the embedded field.
+func newTestStore(t *testing.T) *scopedStorage {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "batchq.db")
 	s, err := Open(context.Background(), path, Options{})
@@ -21,7 +24,11 @@ func newTestStore(t *testing.T) Storage {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s
+	tenant, err := s.EnsureLocalTenant(context.Background(), "_test")
+	if err != nil {
+		t.Fatalf("EnsureLocalTenant: %v", err)
+	}
+	return &scopedStorage{Storage: s, tenant: tenant.ID}
 }
 
 // mkJob builds an in-memory JobDef ready to pass to InsertJob.
@@ -582,7 +589,7 @@ func TestGetJobDependents(t *testing.T) {
 
 // --- helpers -----------------------------------------------------------
 
-func mustInsert(t *testing.T, s Storage, job *jobs.JobDef) {
+func mustInsert(t *testing.T, s *scopedStorage, job *jobs.JobDef) {
 	t.Helper()
 	if err := s.InsertJob(context.Background(), job); err != nil {
 		t.Fatalf("InsertJob %s: %v", job.JobId, err)

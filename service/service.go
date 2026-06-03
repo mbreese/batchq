@@ -6,7 +6,10 @@
 //   - rate-limited dependency resolution
 //   - composing state transitions (e.g. promote waiters after a job ends)
 //
-// The service has no knowledge of HTTP or transport.
+// The service has no knowledge of HTTP or transport. Every entry point
+// expects a tenant ID in the context (set by the server's auth
+// middleware via support.WithTenant) and returns ErrUnauthenticated if
+// none is present.
 package service
 
 import (
@@ -28,9 +31,11 @@ import (
 // Errors mirrored at the service boundary so callers don't import storage
 // directly to compare error values.
 var (
-	ErrJobNotFound  = storage.ErrJobNotFound
-	ErrInvalidState = storage.ErrInvalidState
-	ErrBadRequest   = errors.New("service: bad request")
+	ErrJobNotFound       = storage.ErrJobNotFound
+	ErrInvalidState      = storage.ErrInvalidState
+	ErrBadRequest        = errors.New("service: bad request")
+	ErrUnauthenticated   = errors.New("service: unauthenticated")
+	ErrTenantNotFound    = storage.ErrTenantNotFound
 )
 
 // Service composes the storage layer with batchq's queue semantics.
@@ -47,6 +52,26 @@ func New(s storage.Storage) *Service {
 	return &Service{store: s}
 }
 
+// Store returns the underlying storage handle. Operator-only paths
+// (tenant management CLI, first-start migration) need direct storage
+// access; ordinary request handlers should not use it.
+func (s *Service) Store() storage.Storage {
+	return s.store
+}
+
+// requireTenant extracts the tenant ID from ctx, returning
+// ErrUnauthenticated when none is present. Every Service method that
+// reads or writes the queue calls this first; the auth middleware in
+// the server package is responsible for stashing the tenant before any
+// handler runs.
+func requireTenant(ctx context.Context) (string, error) {
+	t, ok := support.TenantFromContext(ctx)
+	if !ok {
+		return "", ErrUnauthenticated
+	}
+	return t.String(), nil
+}
+
 // --- Submission --------------------------------------------------------
 
 // SubmitJob persists a new job, assigning a UUID. Returns the persisted DTO.
@@ -55,11 +80,16 @@ func New(s storage.Storage) *Service {
 // peer credentials, this method overrides the uid/gid/groups details
 // on the incoming request with the kernel-attested values resolved
 // through NSS — the client cannot influence what identity the runner
-// will use. When peer creds are absent (remote clients, tests with no
-// ConnContext), the client-supplied uid/gid are preserved for
-// backward compatibility; bearer-token-derived identity will fill
-// that gap in a later change.
+// will use. When peer creds are absent (remote clients via bearer
+// token), the client-supplied uid/gid are preserved; the bearer-token
+// path's identity is the *tenant*, not a Unix uid, so the job's
+// uid/gid are whatever the (cluster-side) runner ultimately
+// dispatches it as.
 func (s *Service) SubmitJob(ctx context.Context, req *api.SubmitJobRequest) (*api.JobDTO, error) {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if req == nil {
 		return nil, ErrBadRequest
 	}
@@ -87,7 +117,7 @@ func (s *Service) SubmitJob(ctx context.Context, req *api.SubmitJobRequest) (*ap
 		job.Details = append(job.Details, jobs.JobDefDetail{Key: k, Value: v})
 	}
 
-	if err := s.store.InsertJob(ctx, job); err != nil {
+	if err := s.store.InsertJob(ctx, tenantID, job); err != nil {
 		return nil, err
 	}
 	return api.JobFromDef(job), nil
@@ -153,7 +183,11 @@ func joinUint32(vals []uint32, sep string) string {
 // --- Reads -------------------------------------------------------------
 
 func (s *Service) GetJob(ctx context.Context, jobID string) (*api.JobDTO, error) {
-	job, err := s.store.GetJob(ctx, jobID)
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	job, err := s.store.GetJob(ctx, tenantID, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -175,17 +209,18 @@ type ListJobsOptions struct {
 }
 
 func (s *Service) ListJobs(ctx context.Context, opts ListJobsOptions) ([]*api.JobDTO, error) {
-	var (
-		out []*jobs.JobDef
-		err error
-	)
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []*jobs.JobDef
 	switch {
 	case opts.Query != "":
-		out, err = s.store.SearchJobs(ctx, opts.Query, opts.Statuses)
+		out, err = s.store.SearchJobs(ctx, tenantID, opts.Query, opts.Statuses)
 	case len(opts.Statuses) > 0:
-		out, err = s.store.ListJobsByStatus(ctx, opts.Statuses, opts.SortByStatus)
+		out, err = s.store.ListJobsByStatus(ctx, tenantID, opts.Statuses, opts.SortByStatus)
 	default:
-		out, err = s.store.ListJobs(ctx, opts.ShowAll, opts.SortByStatus)
+		out, err = s.store.ListJobs(ctx, tenantID, opts.ShowAll, opts.SortByStatus)
 	}
 	if err != nil {
 		return nil, err
@@ -194,21 +229,21 @@ func (s *Service) ListJobs(ctx context.Context, opts ListJobsOptions) ([]*api.Jo
 	if opts.RunID != "" || opts.Output != "" || opts.Input != "" {
 		var allow map[string]struct{}
 		if opts.RunID != "" {
-			ids, err := s.store.FindJobsByDetail(ctx, "run_id", opts.RunID)
+			ids, err := s.store.FindJobsByDetail(ctx, tenantID, "run_id", opts.RunID)
 			if err != nil {
 				return nil, err
 			}
 			allow = intersect(allow, ids)
 		}
 		if opts.Output != "" {
-			ids, err := s.store.FindJobsByOutputPath(ctx, opts.Output)
+			ids, err := s.store.FindJobsByOutputPath(ctx, tenantID, opts.Output)
 			if err != nil {
 				return nil, err
 			}
 			allow = intersect(allow, ids)
 		}
 		if opts.Input != "" {
-			ids, err := s.store.FindJobsByInputPath(ctx, opts.Input)
+			ids, err := s.store.FindJobsByInputPath(ctx, tenantID, opts.Input)
 			if err != nil {
 				return nil, err
 			}
@@ -251,7 +286,11 @@ func intersect(allow map[string]struct{}, ids []string) map[string]struct{} {
 }
 
 func (s *Service) GetQueueJobs(ctx context.Context, showAll, sortByStatus bool) ([]*api.JobDTO, error) {
-	out, err := s.store.GetQueueJobs(ctx, showAll, sortByStatus)
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out, err := s.store.GetQueueJobs(ctx, tenantID, showAll, sortByStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -259,11 +298,19 @@ func (s *Service) GetQueueJobs(ctx context.Context, showAll, sortByStatus bool) 
 }
 
 func (s *Service) GetJobDependents(ctx context.Context, jobID string) ([]string, error) {
-	return s.store.GetJobDependents(ctx, jobID)
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.store.GetJobDependents(ctx, tenantID, jobID)
 }
 
 func (s *Service) GetJobStatusCounts(ctx context.Context, showAll bool) (map[string]int, error) {
-	counts, err := s.store.GetJobStatusCounts(ctx, showAll)
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	counts, err := s.store.GetJobStatusCounts(ctx, tenantID, showAll)
 	if err != nil {
 		return nil, err
 	}
@@ -290,27 +337,39 @@ func toDTOs(in []*jobs.JobDef) []*api.JobDTO {
 var ErrForbidden = errors.New("service: forbidden")
 
 func (s *Service) CancelJob(ctx context.Context, jobID, reason string) error {
-	if err := s.authorizeJobAction(ctx, jobID); err != nil {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return err
+	}
+	if err := s.authorizeJobAction(ctx, tenantID, jobID); err != nil {
 		return err
 	}
 	if reason == "" {
 		reason = "user request"
 	}
-	return s.store.CancelJob(ctx, jobID, reason)
+	return s.store.CancelJob(ctx, tenantID, jobID, reason)
 }
 
 func (s *Service) HoldJob(ctx context.Context, jobID string) error {
-	if err := s.authorizeJobAction(ctx, jobID); err != nil {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
 		return err
 	}
-	return s.store.HoldJob(ctx, jobID)
+	if err := s.authorizeJobAction(ctx, tenantID, jobID); err != nil {
+		return err
+	}
+	return s.store.HoldJob(ctx, tenantID, jobID)
 }
 
 func (s *Service) ReleaseJob(ctx context.Context, jobID string) error {
-	if err := s.authorizeJobAction(ctx, jobID); err != nil {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
 		return err
 	}
-	if err := s.store.ReleaseJob(ctx, jobID); err != nil {
+	if err := s.authorizeJobAction(ctx, tenantID, jobID); err != nil {
+		return err
+	}
+	if err := s.store.ReleaseJob(ctx, tenantID, jobID); err != nil {
 		return err
 	}
 	// A just-released job may now be eligible to QUEUE; trigger a pass.
@@ -318,14 +377,16 @@ func (s *Service) ReleaseJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
-// authorizeJobAction enforces the per-job operator check: a caller
-// with kernel-attested peer credentials (i.e. a unix-socket client)
-// can only act on jobs whose stored uid matches their own. Root
-// (uid 0) is an admin and can act on any job. Requests without peer
-// credentials (in-process tests, remote/proxy clients arriving via
-// HTTP through a future TCP listener) are allowed through; remote
-// authz will move under the bearer-token mechanism in a later change.
-func (s *Service) authorizeJobAction(ctx context.Context, jobID string) error {
+// authorizeJobAction enforces the per-job operator check for callers
+// with kernel-attested peer credentials (i.e. unix-socket clients).
+// Tenant scoping in the storage layer already prevents cross-tenant
+// access; this additional check enforces that within a shared local
+// tenant (a server running as root with multiple peer uids), a
+// non-root caller can only act on their own jobs. Root (uid 0)
+// bypasses. Requests without peer credentials (remote bearer-token
+// clients, in-process tests) pass through; tenant scoping is then the
+// only enforcement.
+func (s *Service) authorizeJobAction(ctx context.Context, tenantID, jobID string) error {
 	peer, ok := support.PeerCredsFromContext(ctx)
 	if !ok {
 		return nil
@@ -333,7 +394,7 @@ func (s *Service) authorizeJobAction(ctx context.Context, jobID string) error {
 	if peer.Uid == 0 {
 		return nil
 	}
-	job, err := s.store.GetJob(ctx, jobID)
+	job, err := s.store.GetJob(ctx, tenantID, jobID)
 	if err != nil {
 		return err
 	}
@@ -359,21 +420,29 @@ func (s *Service) authorizeJobAction(ctx context.Context, jobID string) error {
 }
 
 func (s *Service) AdjustJobPriority(ctx context.Context, jobID string, delta int) error {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return err
+	}
 	if delta == 0 {
 		return nil
 	}
-	return s.store.AdjustJobPriority(ctx, jobID, delta)
+	return s.store.AdjustJobPriority(ctx, tenantID, jobID, delta)
 }
 
 func (s *Service) CleanupJob(ctx context.Context, jobID string) error {
-	job, err := s.store.GetJob(ctx, jobID)
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return err
+	}
+	job, err := s.store.GetJob(ctx, tenantID, jobID)
 	if err != nil {
 		return err
 	}
 	if !isTerminal(job.Status) {
 		return fmt.Errorf("%w: cannot clean up non-terminal job (%s)", ErrInvalidState, job.Status)
 	}
-	return s.store.CleanupJob(ctx, jobID)
+	return s.store.CleanupJob(ctx, tenantID, jobID)
 }
 
 func isTerminal(s jobs.StatusCode) bool {
@@ -384,6 +453,10 @@ func isTerminal(s jobs.StatusCode) bool {
 
 // ClaimNextJob is the atomic claim primitive exposed to runners.
 func (s *Service) ClaimNextJob(ctx context.Context, runnerID, kind string, limits storage.Limits) (storage.ClaimResult, error) {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return storage.ClaimResult{}, err
+	}
 	if runnerID == "" {
 		return storage.ClaimResult{}, fmt.Errorf("%w: runner_id required", ErrBadRequest)
 	}
@@ -393,22 +466,34 @@ func (s *Service) ClaimNextJob(ctx context.Context, runnerID, kind string, limit
 	// Best-effort resolve before claiming so newly-eligible waiters become
 	// candidates. Errors here are non-fatal — we still try the claim.
 	_, _ = s.ResolveDependencies(ctx)
-	return s.store.ClaimNextJob(ctx, runnerID, kind, limits)
+	return s.store.ClaimNextJob(ctx, tenantID, runnerID, kind, limits)
 }
 
 func (s *Service) MarkJobProxied(ctx context.Context, runnerID, jobID string, runningDetails map[string]string) error {
-	return s.store.MarkJobProxied(ctx, jobID, runnerID, runningDetails)
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return err
+	}
+	return s.store.MarkJobProxied(ctx, tenantID, jobID, runnerID, runningDetails)
 }
 
 func (s *Service) UpdateRunningDetails(ctx context.Context, jobID string, details map[string]string) error {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return err
+	}
 	if len(details) == 0 {
 		return nil
 	}
-	return s.store.UpdateRunningDetails(ctx, jobID, details)
+	return s.store.UpdateRunningDetails(ctx, tenantID, jobID, details)
 }
 
 func (s *Service) EndJob(ctx context.Context, runnerID, jobID string, returnCode int, notes string) error {
-	if err := s.store.EndJob(ctx, jobID, runnerID, returnCode, notes); err != nil {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return err
+	}
+	if err := s.store.EndJob(ctx, tenantID, jobID, runnerID, returnCode, notes); err != nil {
 		return err
 	}
 	// Success unblocks dependents; failure already cascades cancels.
@@ -419,7 +504,11 @@ func (s *Service) EndJob(ctx context.Context, runnerID, jobID string, returnCode
 }
 
 func (s *Service) EndProxiedJob(ctx context.Context, jobID string, status jobs.StatusCode, startTime, endTime time.Time, returnCode int, notes string) error {
-	if err := s.store.EndProxiedJob(ctx, jobID, status, startTime, endTime, returnCode, notes); err != nil {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return err
+	}
+	if err := s.store.EndProxiedJob(ctx, tenantID, jobID, status, startTime, endTime, returnCode, notes); err != nil {
 		return err
 	}
 	if status == jobs.SUCCESS {
@@ -434,9 +523,13 @@ func (s *Service) EndProxiedJob(ctx context.Context, jobID string, status jobs.S
 // cancels those whose parents failed. Calls are serialized; a concurrent
 // caller waits.
 func (s *Service) ResolveDependencies(ctx context.Context) (storage.ResolveResult, error) {
+	tenantID, err := requireTenant(ctx)
+	if err != nil {
+		return storage.ResolveResult{}, err
+	}
 	s.resolveMu.Lock()
 	defer s.resolveMu.Unlock()
-	return s.store.ResolveDependencies(ctx)
+	return s.store.ResolveDependencies(ctx, tenantID)
 }
 
 // Helpers ---------------------------------------------------------------
