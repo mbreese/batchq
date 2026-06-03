@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"io"
 	"path/filepath"
 	"testing"
 
@@ -21,7 +23,11 @@ func newResolver(t *testing.T) (*authResolver, storage.Storage) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	svc := service.New(st)
-	r, err := newAuthResolver(context.Background(), svc)
+	key := make([]byte, support.MasterKeySize)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		t.Fatalf("master key: %v", err)
+	}
+	r, err := newAuthResolver(context.Background(), svc, key)
 	if err != nil {
 		t.Fatalf("newAuthResolver: %v", err)
 	}
@@ -37,11 +43,11 @@ func TestAuthResolver_PerUidTenants(t *testing.T) {
 	ctxAlice := support.WithPeerCreds(ctx, support.PeerCreds{Uid: 1234, Gid: 100})
 	ctxBob := support.WithPeerCreds(ctx, support.PeerCreds{Uid: 5678, Gid: 200})
 
-	aliceTenant, err := r.resolve(ctxAlice)
+	aliceTenant, err := r.resolve(ctxAlice, "")
 	if err != nil {
 		t.Fatalf("resolve alice: %v", err)
 	}
-	bobTenant, err := r.resolve(ctxBob)
+	bobTenant, err := r.resolve(ctxBob, "")
 	if err != nil {
 		t.Fatalf("resolve bob: %v", err)
 	}
@@ -68,11 +74,11 @@ func TestAuthResolver_IsCached(t *testing.T) {
 	r, st := newResolver(t)
 	ctx := support.WithPeerCreds(context.Background(), support.PeerCreds{Uid: 4242, Gid: 4242})
 
-	first, err := r.resolve(ctx)
+	first, err := r.resolve(ctx, "")
 	if err != nil {
 		t.Fatalf("first resolve: %v", err)
 	}
-	second, err := r.resolve(ctx)
+	second, err := r.resolve(ctx, "")
 	if err != nil {
 		t.Fatalf("second resolve: %v", err)
 	}
@@ -102,7 +108,7 @@ func TestAuthResolver_IsCached(t *testing.T) {
 func TestAuthResolver_FallbackToLocal(t *testing.T) {
 	r, _ := newResolver(t)
 
-	got, err := r.resolve(context.Background())
+	got, err := r.resolve(context.Background(), "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}

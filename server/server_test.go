@@ -24,7 +24,8 @@ import (
 // whether the transport is a unix socket or TCP.
 func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "batchq.db")
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "batchq.db")
 	st, err := storage.Open(context.Background(), dbPath, storage.Options{})
 	if err != nil {
 		t.Fatalf("storage.Open: %v", err)
@@ -32,7 +33,10 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	svc := service.New(st)
-	s, err := New(svc, Options{Listen: "unix:///dev/null"}) // Listen unused
+	s, err := New(svc, Options{
+		Listen:        "unix:///dev/null", // Listen unused; httptest fronts the routes
+		MasterKeyPath: filepath.Join(dir, "master.key"),
+	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}

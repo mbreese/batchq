@@ -27,6 +27,12 @@ var ErrTenantNotFound = errors.New("tenant not found")
 // requested name already exists.
 var ErrTenantExists = errors.New("tenant already exists")
 
+// ErrTokenNotFound is returned when a token id or HMAC lookup misses,
+// or when the token exists but has been revoked or expired (callers
+// MUST treat all three as the same "this token is not usable"
+// outcome so an attacker can't probe which case applies).
+var ErrTokenNotFound = errors.New("token not found")
+
 // TenantKind identifies how a tenant authenticates. Local tenants are
 // implicit, created at first request from a unix-socket peer-cred uid
 // and never carry bearer tokens. Remote tenants are operator-created
@@ -44,6 +50,32 @@ type Tenant struct {
 	Name      string
 	Kind      TenantKind
 	CreatedAt time.Time
+}
+
+// Token is a bearer credential issued for a tenant. The token bytes
+// themselves are never stored; HMAC carries HMAC-SHA256(token,
+// master.key) and is what GetTokenByHMAC keys off of. ExpiresAt is
+// the zero value when the operator chose no expiry at mint time.
+type Token struct {
+	ID        string
+	TenantID  string
+	HMAC      []byte
+	Label     string
+	CreatedAt time.Time
+	ExpiresAt time.Time // zero = never expires
+	RevokedAt time.Time // zero = not revoked
+}
+
+// Active reports whether the token is currently valid to use.
+// Equivalent to !revoked && (no expiry || not yet expired).
+func (t *Token) Active(now time.Time) bool {
+	if !t.RevokedAt.IsZero() {
+		return false
+	}
+	if !t.ExpiresAt.IsZero() && !now.Before(t.ExpiresAt) {
+		return false
+	}
+	return true
 }
 
 // Limits constrains which queued jobs a runner is willing to claim. A value
@@ -103,6 +135,33 @@ type Storage interface {
 	// middleware to lazily provision a tenant for every peer-cred uid
 	// it sees for the first time.
 	EnsureLocalTenant(ctx context.Context, name string) (*Tenant, error)
+
+	// DeleteTenant removes a tenant. Fails if any job or token still
+	// references it; the operator must clean those up first (cleaner
+	// failure than a silent cascade).
+	DeleteTenant(ctx context.Context, id string) error
+
+	// --- Tokens -----------------------------------------------------
+
+	// CreateToken inserts a new token row for tenantID. The caller is
+	// responsible for generating the HMAC. expiresAt is the zero
+	// value when no expiry was requested.
+	CreateToken(ctx context.Context, tenantID string, hmac []byte, label string, expiresAt time.Time) (*Token, error)
+
+	// GetTokenByHMAC looks up a token by its HMAC and returns it
+	// along with its tenant. Returns ErrTokenNotFound when no row
+	// matches, when the token has been revoked, or when the token is
+	// expired — the three are deliberately indistinguishable so an
+	// attacker can't probe which case applies.
+	GetTokenByHMAC(ctx context.Context, hmac []byte) (*Token, *Tenant, error)
+
+	// ListTokensForTenant returns every token issued for tenantID,
+	// ordered by created_at.
+	ListTokensForTenant(ctx context.Context, tenantID string) ([]*Token, error)
+
+	// RevokeToken marks tokenID as revoked. No-op if already
+	// revoked.
+	RevokeToken(ctx context.Context, tokenID string) error
 
 	// --- Job operations ---------------------------------------------
 

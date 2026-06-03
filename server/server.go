@@ -42,6 +42,12 @@ type Options struct {
 	// Required.
 	Listen string
 
+	// MasterKeyPath is the file path where the HMAC secret used for
+	// bearer-token signing lives. Created on first start with mode
+	// 0600 if absent; refused if the existing file has looser perms.
+	// Defaults to <dir-of-Listen>/master.key.
+	MasterKeyPath string
+
 	// SocketMode is the unix-socket file mode. Defaults to 0600 (owner-only).
 	SocketMode os.FileMode
 
@@ -124,7 +130,21 @@ func New(svc *service.Service, opts Options) (*Server, error) {
 		opts.OwnershipCheckInterval = 30 * time.Second
 	}
 
-	auth, err := newAuthResolver(context.Background(), svc)
+	masterKeyPath := opts.MasterKeyPath
+	if masterKeyPath == "" {
+		// Default: sibling of the listen socket. Falls back to "."
+		// for unusual unix:// URLs without a path component.
+		if u, perr := url.Parse(opts.Listen); perr == nil && u.Path != "" {
+			masterKeyPath = filepath.Join(filepath.Dir(u.Path), support.MasterKeyName)
+		} else {
+			masterKeyPath = support.MasterKeyName
+		}
+	}
+	masterKey, err := support.LoadOrCreateMasterKey(masterKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := newAuthResolver(context.Background(), svc, masterKey)
 	if err != nil {
 		return nil, err
 	}

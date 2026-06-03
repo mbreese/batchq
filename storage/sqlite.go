@@ -257,6 +257,154 @@ func (s *sqliteStorage) EnsureLocalTenant(ctx context.Context, name string) (*Te
 	return s.GetTenantByName(ctx, name)
 }
 
+func (s *sqliteStorage) DeleteTenant(ctx context.Context, id string) error {
+	// Refuse if any job or token still references this tenant. The
+	// operator can call cleanup / token revoke / token delete first.
+	var jobCount, tokenCount int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs WHERE tenant_id = ?`, id).Scan(&jobCount); err != nil {
+		return err
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tokens WHERE tenant_id = ?`, id).Scan(&tokenCount); err != nil {
+		return err
+	}
+	if jobCount > 0 || tokenCount > 0 {
+		return fmt.Errorf("%w: tenant has %d jobs and %d tokens", ErrInvalidState, jobCount, tokenCount)
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tenants WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrTenantNotFound
+	}
+	return nil
+}
+
+// --- Tokens ------------------------------------------------------------
+
+func scanToken(sc scanner) (*Token, error) {
+	var t Token
+	var created, expires, revoked sql.NullString
+	if err := sc.Scan(&t.ID, &t.TenantID, &t.HMAC, &t.Label, &created, &expires, &revoked); err != nil {
+		return nil, err
+	}
+	var err error
+	if created.Valid {
+		if t.CreatedAt, err = parseTime(created.String); err != nil {
+			return nil, err
+		}
+	}
+	if expires.Valid && expires.String != "" {
+		if t.ExpiresAt, err = parseTime(expires.String); err != nil {
+			return nil, err
+		}
+	}
+	if revoked.Valid && revoked.String != "" {
+		if t.RevokedAt, err = parseTime(revoked.String); err != nil {
+			return nil, err
+		}
+	}
+	return &t, nil
+}
+
+func (s *sqliteStorage) CreateToken(ctx context.Context, tenantID string, hmacBytes []byte, label string, expiresAt time.Time) (*Token, error) {
+	if tenantID == "" {
+		return nil, errors.New("storage: empty tenantID")
+	}
+	if len(hmacBytes) == 0 {
+		return nil, errors.New("storage: empty hmac")
+	}
+	id := support.NewUUID()
+	created := nowString()
+	var expiresStr any
+	if !expiresAt.IsZero() {
+		expiresStr = formatTime(expiresAt)
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO tokens (id, tenant_id, hmac, label, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		id, tenantID, hmacBytes, label, created, expiresStr)
+	if err != nil {
+		return nil, fmt.Errorf("storage: insert token: %w", err)
+	}
+	createdAt, _ := parseTime(created)
+	return &Token{
+		ID:        id,
+		TenantID:  tenantID,
+		HMAC:      hmacBytes,
+		Label:     label,
+		CreatedAt: createdAt,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func (s *sqliteStorage) GetTokenByHMAC(ctx context.Context, hmacBytes []byte) (*Token, *Tenant, error) {
+	if len(hmacBytes) == 0 {
+		return nil, nil, ErrTokenNotFound
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, tenant_id, hmac, label, created_at, expires_at, revoked_at
+		 FROM tokens WHERE hmac = ?`, hmacBytes)
+	tok, err := scanToken(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, ErrTokenNotFound
+		}
+		return nil, nil, err
+	}
+	// Deliberately collapse revoked / expired / not-found into one
+	// error — the caller (auth middleware) returns 401 in all three
+	// cases, and the indistinguishability matters: an attacker
+	// probing tokens shouldn't be able to learn that one is real
+	// but expired versus simply unknown.
+	if !tok.Active(time.Now().UTC()) {
+		return nil, nil, ErrTokenNotFound
+	}
+	tenant, err := s.GetTenantByID(ctx, tok.TenantID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tok, tenant, nil
+}
+
+func (s *sqliteStorage) ListTokensForTenant(ctx context.Context, tenantID string) ([]*Token, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tenant_id, hmac, label, created_at, expires_at, revoked_at
+		 FROM tokens WHERE tenant_id = ? ORDER BY created_at`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Token
+	for rows.Next() {
+		t, err := scanToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStorage) RevokeToken(ctx context.Context, tokenID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tokens SET revoked_at = ?
+		 WHERE id = ? AND revoked_at IS NULL`,
+		nowString(), tokenID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		// Either no such token or already revoked; surface as
+		// not-found so the operator can decide whether to care
+		// (typically: doesn't matter, it's already revoked).
+		return ErrTokenNotFound
+	}
+	return nil
+}
+
 // --- Submission ---------------------------------------------------------
 
 func (s *sqliteStorage) InsertJob(ctx context.Context, tenantID string, job *jobs.JobDef) error {

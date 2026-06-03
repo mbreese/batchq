@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -113,9 +114,11 @@ func runServer(_ *cobra.Command, _ []string) error {
 	defer store.Close()
 
 	svc := service.New(store)
+	masterKeyPath := filepath.Join(support.GetBatchqHome(), support.MasterKeyName)
 	srv, err := server.New(svc, server.Options{
-		Listen:      serverListen,
-		IdleTimeout: serverIdleTimeout,
+		Listen:        serverListen,
+		MasterKeyPath: masterKeyPath,
+		IdleTimeout:   serverIdleTimeout,
 	})
 	if err != nil {
 		return err

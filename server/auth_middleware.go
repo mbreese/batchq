@@ -2,53 +2,89 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 
+	"github.com/mbreese/batchq/api"
 	"github.com/mbreese/batchq/service"
+	"github.com/mbreese/batchq/storage"
 	"github.com/mbreese/batchq/support"
 )
 
-// authResolver turns an inbound request into a tenant ID. The Phase 2
-// shape: peer credentials on a unix socket get a per-uid implicit
-// local tenant (lazily created and cached); requests without peer
-// credentials fall through to a shared "_local" tenant. Phase 3 adds
-// Authorization: Bearer validation in front of the fallback so remote
-// clients get their real per-tenant identity instead of bucketing
-// into _local.
+// ErrUnauthorized is what the auth middleware surfaces when a bearer
+// token is present but invalid (malformed, unknown, revoked, or
+// expired). All four cases collapse to one error so an attacker
+// probing tokens can't learn which one applies.
+var ErrUnauthorized = errors.New("server: unauthorized")
+
+// authResolver turns an inbound request into a tenant ID. Priority:
+//
+//  1. Authorization: Bearer <tok> → HMAC-verify against master.key,
+//     look up tokens.hmac, return tokens.tenant_id. Invalid bearer →
+//     401 (no fallback). Phase 3.
+//  2. Peer credentials on a unix socket → per-uid implicit local
+//     tenant (lazily created and cached). Phase 2.
+//  3. Neither → fall through to a shared "_local" tenant for
+//     in-process HTTP test transports that don't go through a real
+//     socket. Production HTTPS clients always go through step 1.
 //
 // The cache is keyed by tenant name (not uid) so the same code path
-// serves the bearer-token case once it lands — the resolver just
-// changes its mind about *which* name to look up.
+// serves both peer-cred and bearer-token lookups.
 type authResolver struct {
-	svc          *service.Service
-	localTenant  string // ID of the "_local" fallback tenant, populated at New()
-	cache        sync.Map
+	svc         *service.Service
+	signer      *support.TokenSigner
+	localTenant string // ID of the "_local" fallback tenant
+	cache       sync.Map
 }
 
-// newAuthResolver provisions the "_local" fallback up front so the
-// fallback path doesn't hit the database on every request, and the
-// first peer-cred request for any uid doesn't pay a database round
-// trip for the fallback case.
-func newAuthResolver(ctx context.Context, svc *service.Service) (*authResolver, error) {
+// newAuthResolver provisions the "_local" fallback up front and
+// constructs a TokenSigner from the master key.
+func newAuthResolver(ctx context.Context, svc *service.Service, masterKey []byte) (*authResolver, error) {
 	tenant, err := svc.Store().EnsureLocalTenant(ctx, "_local")
 	if err != nil {
 		return nil, fmt.Errorf("server: ensure _local tenant: %w", err)
 	}
-	a := &authResolver{svc: svc, localTenant: tenant.ID}
+	a := &authResolver{
+		svc:         svc,
+		signer:      support.NewTokenSigner(masterKey),
+		localTenant: tenant.ID,
+	}
 	a.cache.Store("_local", tenant.ID)
 	return a, nil
 }
 
-// resolve returns the tenant ID for ctx. A missing peer cred is not
-// an error — it just means "fall back to _local" until Phase 3 makes
-// bearer tokens authoritative for the remote path.
-func (a *authResolver) resolve(ctx context.Context) (string, error) {
+// resolve returns the tenant ID for the request. A bearer token, if
+// present, takes priority and is authoritative — there's no fallback
+// to peer creds or _local if the token is bad.
+func (a *authResolver) resolve(ctx context.Context, header string) (string, error) {
+	tokenStr, err := support.BearerFromHeader(header)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrUnauthorized, err)
+	}
+	if tokenStr != "" {
+		return a.resolveBearer(ctx, tokenStr)
+	}
 	if peer, ok := support.PeerCredsFromContext(ctx); ok {
 		return a.ensureLocalForUid(ctx, peer.Uid)
 	}
 	return a.localTenant, nil
+}
+
+func (a *authResolver) resolveBearer(ctx context.Context, token string) (string, error) {
+	if err := support.ParseToken(token); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrUnauthorized, err)
+	}
+	hmacBytes := a.signer.HMAC(token)
+	_, tenant, err := a.svc.Store().GetTokenByHMAC(ctx, hmacBytes)
+	if err != nil {
+		if errors.Is(err, storage.ErrTokenNotFound) {
+			return "", ErrUnauthorized
+		}
+		return "", err
+	}
+	return tenant.ID, nil
 }
 
 func (a *authResolver) ensureLocalForUid(ctx context.Context, uid uint32) (string, error) {
@@ -68,11 +104,9 @@ func (a *authResolver) ensureLocalForUid(ctx context.Context, uid uint32) (strin
 	return actual.(string), nil
 }
 
-// withAuth is the middleware that runs the resolver on every request
-// and stashes the resulting tenant ID in the context. A resolver
-// error returns 500 — the only failure mode in Phase 2 is the DB
-// being unreachable, which is genuinely server-side. Once bearer
-// tokens land, invalid-credential failures will surface as 401 here.
+// withAuth runs the resolver on every request and stashes the
+// resulting tenant ID in the context. Failures map to 401 (bad
+// credential) or 500 (DB unreachable).
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Health checks are unauthenticated by design — reverse
@@ -83,9 +117,13 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		tenantID, err := s.auth.resolve(r.Context())
+		tenantID, err := s.auth.resolve(r.Context(), r.Header.Get(api.HeaderAuthorization))
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("%w: resolve tenant: %v", service.ErrBadRequest, err))
+			if errors.Is(err, ErrUnauthorized) {
+				writeError(w, http.StatusUnauthorized, err)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		ctx := support.WithTenant(r.Context(), support.TenantID(tenantID))
