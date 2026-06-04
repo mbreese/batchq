@@ -47,6 +47,9 @@ These pages cover how batchq is put together and how to deploy and use it.
 - [Tenants and tokens](tenants.md) — operator guide for the multi-tenant
   remote-server case: `batchq tenant create`, `batchq token mint`, the
   master key, and the threat model.
+- [`deploy/`](../deploy/README.md) — Dockerfile + Docker Compose
+  (batchq + Postgres + optional Caddy/HTTPS) + Kubernetes manifests
+  for the multi-tenant case.
 
 ## A note on the README
 

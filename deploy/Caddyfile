@@ -1,0 +1,14 @@
+# Caddy front for the batchq server's unix socket.
+#
+# `localhost` triggers Caddy's self-signed cert mode (you'll see a
+# browser warning on first visit; clients can pin via --remote
+# anyway). For a real domain, replace the line with your hostname
+# and Caddy auto-fetches a Let's Encrypt cert.
+
+localhost {
+    # Forward everything to the unix socket inside batchq's home.
+    reverse_proxy unix//var/lib/batchq/batchq.sock {
+        header_up Host {host}
+        flush_interval -1
+    }
+}

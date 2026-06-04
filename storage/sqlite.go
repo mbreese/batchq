@@ -86,6 +86,23 @@ func Open(ctx context.Context, path string, opts Options) (Storage, error) {
 	return &sqliteStorage{db: conn, path: path}, nil
 }
 
+// OpenURL dispatches by the URL scheme to the right Storage impl:
+// sqlite3:// opens a SQLite file (Open), postgres:// opens a Postgres
+// connection (OpenPostgres). Other schemes are rejected. Use this
+// from CLI entry points that hand the raw [server] db value through
+// — Open / OpenPostgres remain available for callers that want to
+// pick the backend explicitly.
+func OpenURL(ctx context.Context, url string, opts Options) (Storage, error) {
+	switch {
+	case strings.HasPrefix(url, "sqlite3://"):
+		return Open(ctx, strings.TrimPrefix(url, "sqlite3://"), opts)
+	case strings.HasPrefix(url, "postgres://"), strings.HasPrefix(url, "postgresql://"):
+		return OpenPostgres(ctx, url)
+	default:
+		return nil, fmt.Errorf("storage: unsupported backend URL %q (want sqlite3:// or postgres://)", url)
+	}
+}
+
 // Reset destroys any existing DB at path and creates a fresh one with the
 // schema applied. Used by the `batchq initdb --force` path. The caller is
 // responsible for confirming with the user before invoking.

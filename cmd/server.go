@@ -77,16 +77,6 @@ func runServer(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	if backend.Scheme != support.BackendSqlite3 {
-		return fmt.Errorf("server: db scheme %q not yet implemented", backend.Scheme)
-	}
-	storagePath, err := backend.SqlitePath()
-	if err != nil {
-		return err
-	}
-	if expanded, err := support.ExpandPathAbs(storagePath); err == nil {
-		storagePath = expanded
-	}
 
 	if serverListen == "" {
 		serverListen = Config.Server.Listen
@@ -107,7 +97,18 @@ func runServer(_ *cobra.Command, _ []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	store, err := storage.Open(ctx, storagePath, storage.Options{WAL: serverWAL})
+	// Expand sqlite paths so logs and error messages carry the
+	// resolved on-disk location, not the user's literal config.
+	dbURL := backend.Raw
+	if backend.Scheme == support.BackendSqlite3 {
+		if p, err := backend.SqlitePath(); err == nil {
+			if expanded, err := support.ExpandPathAbs(p); err == nil {
+				dbURL = "sqlite3://" + expanded
+			}
+		}
+	}
+
+	store, err := storage.OpenURL(ctx, dbURL, storage.Options{WAL: serverWAL})
 	if err != nil {
 		return fmt.Errorf("open storage: %w", err)
 	}

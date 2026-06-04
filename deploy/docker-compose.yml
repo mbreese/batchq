@@ -1,0 +1,54 @@
+# Turnkey batchq + Postgres stack.
+#
+# Usage:
+#   cd deploy && docker compose up --build
+#
+# This brings up:
+#   - postgres (with persistent volume)
+#   - batchq server (Postgres backend, persistent $BATCHQ_HOME with master.key)
+#
+# Operator commands (create tenants, mint tokens) run inside the batchq
+# container so they share its $BATCHQ_HOME and Postgres connection:
+#
+#   docker compose exec batchq batchq tenant create alice
+#   docker compose exec batchq batchq token mint --tenant alice
+#
+# The batchq server listens on a unix socket inside its own volume.
+# Use docker-compose.https.yml as an overlay to add a Caddy reverse
+# proxy that terminates TLS and forwards to the socket:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: batchq
+      POSTGRES_PASSWORD: batchq
+      POSTGRES_DB: batchq
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U batchq -d batchq"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  batchq:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BATCHQ_HOME: /var/lib/batchq
+    volumes:
+      - batchq-home:/var/lib/batchq
+      - ./batchq.toml:/var/lib/batchq/config:ro
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  batchq-home:

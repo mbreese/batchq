@@ -1,0 +1,14 @@
+# batchq config for the Docker Compose stack.
+#
+# The DB URL points at the postgres service from docker-compose.yml.
+# If you want to share this config with a non-Docker deployment, copy
+# it to $BATCHQ_HOME/config and adjust the DB URL.
+
+[batchq]
+multiuser = true               # enable owner-displaying modes
+autospawn_wait_timeout = "10s"
+
+[server]
+listen       = "unix:///var/lib/batchq/batchq.sock"
+db           = "postgres://batchq:batchq@postgres:5432/batchq?sslmode=disable"
+idle_timeout = "0s"            # run forever; the supervisor (compose) restarts on crash

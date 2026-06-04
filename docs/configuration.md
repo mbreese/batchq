@@ -94,7 +94,7 @@ Ignored entirely when `[batchq] remote` is set (no local server runs).
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `listen` | string | `unix://$BATCHQ_HOME/batchq.sock` | The unix socket the server binds. Only `unix://` URLs are accepted. |
-| `db` | string | `sqlite3://$BATCHQ_HOME/batchq.db` | The database URL. `sqlite3:///path` today; `postgres://…` is reserved for future use. |
+| `db` | string | `sqlite3://$BATCHQ_HOME/batchq.db` | The database URL. `sqlite3:///path` for the default local SQLite backend; `postgres://user:pass@host:port/dbname` for the Postgres backend (multi-tenant remote deployments). See [deploy/](../deploy/README.md) for turnkey Docker Compose + Kubernetes manifests. |
 | `idle_timeout` | duration | (unset, no shutdown) | If non-zero, the server shuts down after this duration of no requests. Autospawned servers use a built-in `1m` value. |
 | `sqlite_wal` | bool | `false` | Opt into SQLite WAL journaling. Off by default because WAL's `-shm` shared-memory file is unsafe on NFS/Lustre. Only enable when the DB file is on local disk. |
 

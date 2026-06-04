@@ -1,0 +1,33 @@
+# Caddy reverse-proxy overlay for batchq + Postgres.
+#
+# Brings TLS termination in front of batchq's unix socket. Caddy
+# reads the socket via a shared volume that both batchq and caddy
+# mount, so no TCP listener on batchq is needed.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up
+#
+# By default Caddy generates a self-signed cert and listens on
+# https://localhost. For a real domain, replace `localhost` in
+# Caddyfile with your domain and Caddy will fetch a Let's Encrypt
+# cert automatically. Ports 80 (HTTP→HTTPS redirect + ACME challenge)
+# and 443 (HTTPS) are exposed.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - batchq
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - batchq-home:/var/lib/batchq:ro    # share batchq's socket
+      - caddy-data:/data                  # ACME state
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:

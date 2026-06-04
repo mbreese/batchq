@@ -1,0 +1,217 @@
+# Minimal Kubernetes manifests for batchq + Postgres.
+#
+# Apply:
+#   kubectl apply -f deploy/k8s/batchq.yaml
+#
+# This creates one Namespace, a Postgres StatefulSet (with PVC) and
+# a batchq Deployment with a Caddy sidecar that fronts the unix
+# socket with HTTPS. A LoadBalancer Service exposes the proxy.
+#
+# Before applying:
+#   * Replace the Postgres password secret (or use a sealed-secrets /
+#     vault setup) — the default below is a placeholder.
+#   * Replace `localhost` in the Caddy ConfigMap with your real
+#     domain so Caddy can fetch a Let's Encrypt cert.
+#   * Pick an image tag in the batchq Deployment (this assumes you
+#     have pushed an image you built from this repo's Dockerfile).
+#
+# For a managed-postgres deployment (RDS, Cloud SQL, etc.), drop the
+# StatefulSet and PVC sections and point BATCHQ_DB at the managed
+# endpoint via a Secret.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: batchq
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: batchq-postgres
+  namespace: batchq
+type: Opaque
+stringData:
+  POSTGRES_USER: batchq
+  POSTGRES_PASSWORD: change-me-before-applying
+  POSTGRES_DB: batchq
+  # Full URL the batchq container consumes:
+  BATCHQ_DB: "postgres://batchq:change-me-before-applying@postgres:5432/batchq?sslmode=disable"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: batchq-postgres-data
+  namespace: batchq
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: batchq
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          envFrom:
+            - secretRef:
+                name: batchq-postgres
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "batchq", "-d", "batchq"]
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: batchq-postgres-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: batchq
+spec:
+  clusterIP: None # headless; the StatefulSet's DNS resolves to the single pod
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: batchq-home
+  namespace: batchq
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: batchq-caddy
+  namespace: batchq
+data:
+  Caddyfile: |
+    localhost {
+        reverse_proxy unix//var/lib/batchq/batchq.sock {
+            header_up Host {host}
+            flush_interval -1
+        }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batchq
+  namespace: batchq
+spec:
+  replicas: 1 # batchq's single-instance invariant: never scale this beyond 1
+  selector:
+    matchLabels:
+      app: batchq
+  strategy:
+    type: Recreate # never run two batchq pods at once
+  template:
+    metadata:
+      labels:
+        app: batchq
+    spec:
+      containers:
+        - name: batchq
+          image: ghcr.io/mbreese/batchq:latest # replace with your image
+          env:
+            - name: BATCHQ_HOME
+              value: /var/lib/batchq
+            - name: BATCHQ_DB
+              valueFrom:
+                secretKeyRef:
+                  name: batchq-postgres
+                  key: BATCHQ_DB
+          args:
+            - server
+            - --db=$(BATCHQ_DB)
+          volumeMounts:
+            - name: home
+              mountPath: /var/lib/batchq
+
+        # Caddy sidecar terminates TLS and forwards to the unix
+        # socket via the shared `home` volume.
+        - name: caddy
+          image: caddy:2-alpine
+          ports:
+            - containerPort: 443
+              name: https
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - name: caddy-config
+              mountPath: /etc/caddy
+              readOnly: true
+            - name: home
+              mountPath: /var/lib/batchq
+              readOnly: true
+            - name: caddy-data
+              mountPath: /data
+            - name: caddy-data
+              mountPath: /config
+              subPath: config
+
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: batchq-home
+        - name: caddy-config
+          configMap:
+            name: batchq-caddy
+        - name: caddy-data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: batchq
+  namespace: batchq
+spec:
+  type: LoadBalancer # swap for ClusterIP + Ingress in production
+  selector:
+    app: batchq
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+    - name: http
+      port: 80
+      targetPort: http
