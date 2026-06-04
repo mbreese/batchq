@@ -24,7 +24,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.23'
+          go-version: '1.25'
       - name: Test
         run: go test ./...
 
@@ -55,7 +55,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.23'
+          go-version: '1.25'
 
       # Build via `make` so VERSION ldflags (from scripts/version.sh)
       # are baked into every binary. Branch builds get a suffix

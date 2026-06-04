@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build, run, test
 
-This is a Go module (Go 1.23). batchq is **pure Go** — `modernc.org/sqlite` replaces `mattn/go-sqlite3`, so there is no CGO and no C cross-toolchain anywhere in the build.
+This is a Go module (Go 1.25+). batchq is **pure Go** — `modernc.org/sqlite` replaces `mattn/go-sqlite3`, so there is no CGO and no C cross-toolchain anywhere in the build.
 
 - Build for current host: `go build -o bin/batchq main.go` (or `make`, which produces `bin/batchq.linux`).
 - Cross-compile is just `GOOS=… GOARCH=… go build` — no toolchain prep. The `Makefile` has targets for `linux_amd64`, `linux_arm64`, `macos_amd64`, `macos_arm64`.
@@ -12,7 +12,7 @@ This is a Go module (Go 1.23). batchq is **pure Go** — `modernc.org/sqlite` re
 - Tests: `go test ./...`. Single test: `go test ./cmd -run TestName`.
 - Version string: `cmd.Version` is set at build time via `-ldflags`. The Makefile resolves it from `git describe`: exact-tag commits get the tag (e.g. `v0.2.0`); anything else gets `v0.2.0-dev-<short-sha>`. Plain `go run` / `go build` (no ldflags) yields the literal `"dev"`. Bump the dev base in the Makefile when starting work on the next minor series. Surfaced via `batchq version`, `batchq --version`, and a footer line on every command's `--help`.
 - The hidden `batchq debug` subcommand prints the resolved configuration: `$BATCHQ_HOME`, config file path, every env var that's consumed, and every knob in every config section with its source labelled (`flag` / `env` / `config` / `default` / `unset`). First stop when diagnosing config loading.
-- A Docker-based Go toolchain wrapper at `/tmp/dgo` is available in the dev environment when no host `go` is installed; it shells out to the `mcr.microsoft.com/devcontainers/go:1-1.23` image with the repo bind-mounted.
+- A Docker-based Go toolchain wrapper at `/tmp/dgo` is available in the dev environment when no host `go` is installed; it shells out to the `mcr.microsoft.com/devcontainers/go:1-1.25` image with the repo bind-mounted.
 
 ## Architecture (v2 client/server)
 

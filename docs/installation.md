@@ -7,7 +7,7 @@ for any target.
 
 ## Requirements
 
-- Go 1.23 or newer (only for building from source).
+- Go 1.25 or newer (only for building from source).
 - Linux or macOS. The two supported platforms today are `linux` and
   `darwin` on `amd64` and `arm64`. Windows is not supported (the server
   binds a unix socket).
