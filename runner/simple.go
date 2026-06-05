@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,11 +31,17 @@ type simpleRunner struct {
 	foreverMode    bool
 	useCgroupV2    bool
 	useCgroupV1    bool
+	// curJobs, availProcs, and availMem are scheduling state shared between
+	// the run loop and the per-job completion goroutines; all access goes
+	// through r.lock (see snapshotState). availJobs is touched only by the
+	// run loop. keepRunning is set from the signal handler too, so it's an
+	// atomic rather than lock-guarded.
 	curJobs        []jobStatus
 	maxJobs        int
 	availJobs      int
 	availProcs     int
 	availMem       int
+	keepRunning    atomic.Bool
 	resources      map[string]string
 	shellBin       string
 	runnerId       string
@@ -82,6 +89,28 @@ func (r *simpleRunner) wake() {
 	case r.wakeup <- struct{}{}:
 	default:
 	}
+}
+
+// snapshotState returns a copy of the running-job list plus the current
+// available proc/mem counters, read atomically under r.lock. The run loop
+// uses this so it can iterate jobs and make scheduling decisions without
+// holding the lock across the REST calls in between (the per-job completion
+// goroutines need the lock to remove finished jobs and return resources). The
+// returned slice is a copy; each jobStatus shares the underlying *JobDTO and
+// *exec.Cmd, which are stable for the life of a job.
+func (r *simpleRunner) snapshotState() (curJobs []jobStatus, availProcs, availMem int) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	curJobs = make([]jobStatus, len(r.curJobs))
+	copy(curJobs, r.curJobs)
+	return curJobs, r.availProcs, r.availMem
+}
+
+// numJobs returns the count of currently running jobs under r.lock.
+func (r *simpleRunner) numJobs() int {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	return len(r.curJobs)
 }
 
 func (r *simpleRunner) SetMaxProcs(procs int) *simpleRunner {
@@ -235,7 +264,7 @@ func (r *simpleRunner) Start() bool {
 	r.availMem = r.maxMemoryMb
 	r.availJobs = r.maxJobs
 
-	keepRunning := true
+	r.keepRunning.Store(true)
 	ranAtLeastOneJob := false
 
 	// Channel to receive OS signals
@@ -272,14 +301,17 @@ func (r *simpleRunner) Start() bool {
 				sigCount++
 				switch sigCount {
 				case 1:
-					keepRunning = false
+					r.keepRunning.Store(false)
 					r.logf("Waiting for jobs to complete. Hit Ctrl+C again to kill everything.\n")
 					r.wake()
 				case 2:
 					r.logf("Killing all running jobs...\n")
-					for len(r.curJobs) > 0 {
-						curJob := r.curJobs[0]
-						r.curJobs = r.curJobs[1:]
+					// Cancel every running job from a snapshot taken under
+					// the lock. We don't mutate curJobs here — each job's
+					// completion goroutine removes its own entry once the
+					// killed process exits, so this can't race their writes.
+					killing, _, _ := r.snapshotState()
+					for _, curJob := range killing {
 						r.logf("Killing job %s [proc: %d]\n", curJob.job.JobID, curJob.cmd.Process.Pid)
 						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 						if err := r.client.CancelJob(ctx, curJob.job.JobID, "Shutting down runner"); err != nil {
@@ -301,9 +333,13 @@ func (r *simpleRunner) Start() bool {
 	if r.foreverMode {
 		r.logf("Hit Ctrl+C to exit. Will try to drain jobs first.")
 	}
-	for keepRunning || len(r.curJobs) > 0 {
-		// check to see if we need to cancel a running job
-		for _, curJob := range r.curJobs {
+	for r.keepRunning.Load() || r.numJobs() > 0 {
+		// check to see if we need to cancel a running job. Iterate a
+		// snapshot taken under the lock so the per-job REST calls below
+		// don't run while holding it (completion goroutines need the lock
+		// to remove finished jobs and return their resources).
+		curJobs, _, _ := r.snapshotState()
+		for _, curJob := range curJobs {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 			// this could be optimized, but just iterating over jobs
@@ -345,34 +381,40 @@ func (r *simpleRunner) Start() bool {
 			}
 		}
 
-		if r.IsDrain() || !keepRunning {
-			r.logf("Draining jobs (remaining:%d)\n", len(r.curJobs))
-			if r.IsDrain() && len(r.curJobs) == 0 {
-				keepRunning = false
+		drain := r.IsDrain()
+		if drain || !r.keepRunning.Load() {
+			n := r.numJobs()
+			r.logf("Draining jobs (remaining:%d)\n", n)
+			if drain && n == 0 {
+				r.keepRunning.Store(false)
 				r.logf("Done processing jobs")
 			}
 		} else {
+			// Snapshot scheduling state under the lock; the per-job
+			// completion goroutines mutate curJobs/availProcs/availMem under
+			// the same lock as they finish.
+			curJobs, availProcs, availMem := r.snapshotState()
 			// check to see if we have the resources to run a job
 			findJob := false
-			r.logf("Available resources (c:%d, m:%d)\n", r.availProcs, r.availMem)
+			r.logf("Available resources (c:%d, m:%d)\n", availProcs, availMem)
 			if maxConcurrentJobs > 0 {
-				if len(r.curJobs) < maxConcurrentJobs {
+				if len(curJobs) < maxConcurrentJobs {
 					findJob = true
 				}
 			} else {
-				if r.availMem > 0 && r.availProcs > 0 {
+				if availMem > 0 && availProcs > 0 {
 					findJob = true
-				} else if r.availMem > 0 && r.availProcs == -1 {
+				} else if availMem > 0 && availProcs == -1 {
 					findJob = true
-				} else if r.availProcs > 0 && r.availMem == -1 {
+				} else if availProcs > 0 && availMem == -1 {
 					findJob = true
 				}
 			}
 
-			if keepRunning && r.availJobs == 0 {
+			if r.keepRunning.Load() && r.availJobs == 0 {
 				// No more jobs allowed
 				findJob = false
-				keepRunning = false
+				r.keepRunning.Store(false)
 				r.logf("Reached maximum job count (%d). Not starting new jobs.\n", r.maxJobs)
 			}
 
@@ -380,7 +422,7 @@ func (r *simpleRunner) Start() bool {
 			if findJob {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
-				resp, err := r.client.ClaimNextJob(ctx, r.runnerId, "simple", r.host, r.availProcs, r.availMem, r.maxWalltimeSec, r.availableResources())
+				resp, err := r.client.ClaimNextJob(ctx, r.runnerId, "simple", r.host, availProcs, availMem, r.maxWalltimeSec, r.availableResources())
 				cancel()
 				if err != nil {
 					r.logf("Error claiming job: %v\n", err)
@@ -388,17 +430,18 @@ func (r *simpleRunner) Start() bool {
 					job := resp.Job
 					r.logf("Processing job: %s\n", job.JobID)
 					r.lock.Lock()
-					if !r.startJob(job) {
-						r.logf("Error starting job -- draining")
-						keepRunning = false
-					}
+					ok := r.startJob(job)
 					r.lock.Unlock()
+					if !ok {
+						r.logf("Error starting job -- draining")
+						r.keepRunning.Store(false)
+					}
 					ranAtLeastOneJob = true
 					if r.availJobs > 0 {
 						r.availJobs--
 					}
 					continue
-				} else if len(r.curJobs) == 0 && !resp.MoreEligible && !r.foreverMode {
+				} else if r.numJobs() == 0 && !resp.MoreEligible && !r.foreverMode {
 					// Nothing running and we claimed nothing. With no jobs
 					// running, the limits we just offered were our full
 					// capacity, so any Blocked jobs exceed what this runner can
@@ -410,7 +453,7 @@ func (r *simpleRunner) Start() bool {
 					} else {
 						r.logf("Done processing jobs")
 					}
-					keepRunning = false
+					r.keepRunning.Store(false)
 				}
 			}
 		}
@@ -418,7 +461,7 @@ func (r *simpleRunner) Start() bool {
 		// do we have more jobs to run? should we keep waiting to
 		// run more jobs? if we are draining, let's wait to see if the jobs finish...
 
-		if keepRunning || len(r.curJobs) > 0 {
+		if r.keepRunning.Load() || r.numJobs() > 0 {
 			// Wait for a running job to finish (r.wake from the completion
 			// goroutine) or a fallback heartbeat to re-poll for new work. The
 			// wakeup channel is always available, so a completion never races
