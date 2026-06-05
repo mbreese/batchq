@@ -51,6 +51,9 @@ func GetCurrentUsername() string {
 }
 
 func ExpandPathAbs(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
 	endsWithSlash := false
 	if path[len(path)-1] == os.PathSeparator {
 		endsWithSlash = true

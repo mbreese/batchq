@@ -240,12 +240,19 @@ var submitCmd = &cobra.Command{
 						sub := line[10:]
 						spl := strings.SplitN(sub, "=", 2)
 						k = strings.TrimSpace(spl[0])
-						v = strings.TrimSpace(spl[1])
+						// Valueless long flags (e.g. "#SBATCH --hold") split
+						// into a single element; leave v empty rather than
+						// indexing spl[1] out of range.
+						if len(spl) > 1 {
+							v = strings.TrimSpace(spl[1])
+						}
 					} else if len(line) > 9 && line[:9] == "#SBATCH -" {
 						sub := line[9:]
 						spl := strings.SplitN(sub, " ", 2)
 						k = strings.TrimSpace(spl[0])
-						v = strings.TrimSpace(spl[1])
+						if len(spl) > 1 {
+							v = strings.TrimSpace(spl[1])
+						}
 					}
 					if k != "" {
 						switch k {
@@ -554,6 +561,9 @@ func parseDepEntry(entry string) (kind, target string) {
 }
 
 func isDirectory(path string) (bool, error) {
+	if path == "" {
+		return false, fmt.Errorf("empty path")
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		if path[len(path)-1] == os.PathSeparator {
