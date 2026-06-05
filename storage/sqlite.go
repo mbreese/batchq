@@ -708,7 +708,7 @@ func (s *sqliteStorage) GetQueueJobs(ctx context.Context, showAll, sortByStatus 
 		LEFT JOIN (
 			SELECT job_id, group_concat(key || '=' || value, char(10)) AS running
 			FROM job_running_details
-			WHERE key IN ('pid', 'slurm_status', 'slurm_job_id', 'slurm_array_id', 'slurm_task_index')
+			WHERE key IN ('pid', 'host', 'slurm_status', 'slurm_job_id', 'slurm_array_id', 'slurm_task_index')
 			GROUP BY job_id
 		) running ON running.job_id = j.id
 	`
