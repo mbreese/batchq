@@ -363,7 +363,7 @@ func (r *simpleRunner) Start() bool {
 				// Check to see if the job has a walltime set...
 				if val := job.Details["walltime"]; val != "" {
 					if jobTime, err := strconv.Atoi(val); err != nil {
-						log.Fatal(err)
+						r.logf("Job %s: unparseable walltime %q, skipping limit check: %v\n", curJob.job.JobID, val, err)
 					} else if jobTime > 0 {
 						duration := time.Now().UTC().Sub(curJob.startTime)
 						if duration.Seconds() > float64(jobTime) {
@@ -530,18 +530,22 @@ func (r *simpleRunner) startJob(job *api.JobDTO) bool {
 	jobMem := -1
 
 	if val := job.Details["procs"]; val != "" {
-		if p, err := strconv.Atoi(val); err != nil {
-			log.Fatal(err)
-		} else {
-			jobProcs = p
+		p, err := strconv.Atoi(val)
+		if err != nil {
+			r.logf("Job %s: invalid procs detail %q: %v\n", job.JobID, val, err)
+			r.failClaimedJob(job.JobID, 1, fmt.Sprintf("invalid procs detail %q: %v", val, err))
+			return false
 		}
+		jobProcs = p
 	}
 	if val := job.Details["mem"]; val != "" {
-		if m, err := strconv.Atoi(val); err != nil {
-			log.Fatal(err)
-		} else {
-			jobMem = m
+		m, err := strconv.Atoi(val)
+		if err != nil {
+			r.logf("Job %s: invalid mem detail %q: %v\n", job.JobID, val, err)
+			r.failClaimedJob(job.JobID, 1, fmt.Sprintf("invalid mem detail %q: %v", val, err))
+			return false
 		}
+		jobMem = m
 	}
 
 	script := filepath.Join(r.spoolDir, fmt.Sprintf("batchq-%s.sh", job.JobID))
@@ -559,15 +563,13 @@ func (r *simpleRunner) startJob(job *api.JobDTO) bool {
 		if cmd.Process != nil {
 			pgid, _ := syscall.Getpgid(cmd.Process.Pid)
 			r.logf("Canceling job: %s [%d]\n", job.JobID, pgid)
-			// the negative should kill all members of the pgid
-			syscall.Kill(-pgid, syscall.SIGKILL)
-			ps, err := cmd.Process.Wait()
-			if err != nil {
-				r.logf("Error killing process %d: %v\n", pgid, err)
-			} else if ps != nil {
-				r.logf("Killing process %d: %v\n", pgid, ps.String())
-			} else {
-				r.logf("Killing process %d: done\n", pgid)
+			// Kill the whole process group (negative pgid). We deliberately
+			// do NOT Wait here: the completion goroutine started below owns
+			// the single Process.Wait() for this command. A second Wait would
+			// race it, and only one can succeed — the other gets a bogus
+			// nil/errored state.
+			if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+				r.logf("Error killing process group %d for job %s: %v\n", pgid, job.JobID, err)
 			}
 		} else {
 			r.logf("Canceling job: %s, but process already done\n", job.JobID)
@@ -583,6 +585,29 @@ func (r *simpleRunner) startJob(job *api.JobDTO) bool {
 
 	var stdoutFile *os.File
 	var stderrFile *os.File
+
+	cgroupV2Path := fmt.Sprintf("/sys/fs/cgroup/batchq-%s", job.JobID)
+	cgroupV1BaseCPU := fmt.Sprintf("/sys/fs/cgroup/cpu/batchq-%s", job.JobID)
+	cgroupV1BaseMem := fmt.Sprintf("/sys/fs/cgroup/memory/batchq-%s", job.JobID)
+
+	// cleanup releases what startJob has acquired so far (open stdout/stderr
+	// files and any cgroup dirs). Call it on every failure path that returns
+	// false before the completion goroutine — which otherwise owns this
+	// teardown — has started. Removing a cgroup dir that was never created is
+	// a no-op.
+	cleanup := func() {
+		if stdoutFile != nil {
+			stdoutFile.Close()
+		}
+		if stderrFile != nil {
+			stderrFile.Close()
+		}
+		if r.useCgroupV2 && support.AmIRoot() {
+			os.RemoveAll(cgroupV2Path)
+		} else if r.useCgroupV1 && support.AmIRoot() {
+			_ = cleanupCgroupV1([]string{cgroupV1BaseCPU, cgroupV1BaseMem})
+		}
+	}
 
 	jobStdout := expandArrayPlaceholders(job, job.Details["stdout"])
 	jobStderr := expandArrayPlaceholders(job, job.Details["stderr"])
@@ -628,6 +653,7 @@ func (r *simpleRunner) startJob(job *api.JobDTO) bool {
 		uid, err := strconv.Atoi(uidS)
 		if err != nil {
 			r.logf("Missing UID from job details: %s\n", job.JobID)
+			cleanup()
 			r.failClaimedJob(job.JobID, 1, "missing or invalid UID in job details")
 			return false
 		}
@@ -635,6 +661,7 @@ func (r *simpleRunner) startJob(job *api.JobDTO) bool {
 
 		if err != nil {
 			r.logf("Missing GID from job details: %s\n", job.JobID)
+			cleanup()
 			r.failClaimedJob(job.JobID, 1, "missing or invalid GID in job details")
 			return false
 		}
@@ -682,49 +709,76 @@ func (r *simpleRunner) startJob(job *api.JobDTO) bool {
 		}
 	}
 
-	cgroupV2Path := fmt.Sprintf("/sys/fs/cgroup/batchq-%s", job.JobID)
-	cgroupV1BaseCPU := fmt.Sprintf("/sys/fs/cgroup/cpu/batchq-%s", job.JobID)
-	cgroupV1BaseMem := fmt.Sprintf("/sys/fs/cgroup/memory/batchq-%s", job.JobID)
-	if r.useCgroupV2 && support.AmIRoot() {
-
-		// setup cgroups
-
-		// Create the cgroup directory
-		if err := os.MkdirAll(cgroupV2Path, 0755); err != nil {
-			panic(err)
+	// cgroupWrite writes a cgroup control file, failing the job cleanly
+	// (before the process starts) rather than panicking the whole runner if
+	// the kernel rejects the value. Returns false once the job has been
+	// failed, so the caller should return false too.
+	cgroupWrite := func(path, content string) bool {
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			r.logf("Job %s: cgroup setup (%s): %v\n", job.JobID, path, err)
+			cleanup()
+			r.failClaimedJob(job.JobID, 1, fmt.Sprintf("cgroup setup failed: %v", err))
+			return false
 		}
-
+		return true
+	}
+	if r.useCgroupV2 && support.AmIRoot() {
+		// Create the cgroup directory, then set the limits.
+		if err := os.MkdirAll(cgroupV2Path, 0755); err != nil {
+			r.logf("Job %s: cgroup mkdir %s: %v\n", job.JobID, cgroupV2Path, err)
+			cleanup()
+			r.failClaimedJob(job.JobID, 1, fmt.Sprintf("cgroup setup failed: %v", err))
+			return false
+		}
 		if jobProcs > 0 {
-			support.MustWriteFile(filepath.Join(cgroupV2Path, "cpu.max"), fmt.Sprintf("%d 100000", 100000*jobProcs)) // 2 CPUs (200ms every 100ms)
+			if !cgroupWrite(filepath.Join(cgroupV2Path, "cpu.max"), fmt.Sprintf("%d 100000", 100000*jobProcs)) {
+				return false
+			}
 		}
 		if jobMem > 0 {
-			support.MustWriteFile(filepath.Join(cgroupV2Path, "memory.max"), fmt.Sprintf("%dM", jobMem)) // 100MB limit
+			if !cgroupWrite(filepath.Join(cgroupV2Path, "memory.max"), fmt.Sprintf("%dM", jobMem)) {
+				return false
+			}
 		}
 	} else if r.useCgroupV1 && support.AmIRoot() {
 		_ = os.MkdirAll(cgroupV1BaseCPU, 0755)
 		_ = os.MkdirAll(cgroupV1BaseMem, 0755)
 		// Set CPU quota (e.g., 2 CPUs assuming 100000us period)
-		support.MustWriteFile(filepath.Join(cgroupV1BaseCPU, "cpu.cfs_period_us"), "100000")
-		support.MustWriteFile(filepath.Join(cgroupV1BaseCPU, "cpu.cfs_quota_us"), fmt.Sprintf("%d", 100000*jobProcs))
-
+		if !cgroupWrite(filepath.Join(cgroupV1BaseCPU, "cpu.cfs_period_us"), "100000") {
+			return false
+		}
+		if !cgroupWrite(filepath.Join(cgroupV1BaseCPU, "cpu.cfs_quota_us"), fmt.Sprintf("%d", 100000*jobProcs)) {
+			return false
+		}
 		// Set memory limit
-		support.MustWriteFile(filepath.Join(cgroupV1BaseMem, "memory.limit_in_bytes"), fmt.Sprintf("%d", jobMem*1024*1024)) //  MB
-
+		if !cgroupWrite(filepath.Join(cgroupV1BaseMem, "memory.limit_in_bytes"), fmt.Sprintf("%d", jobMem*1024*1024)) {
+			return false
+		}
 	}
 
 	err := cmd.Start()
 	if err != nil {
 		r.logf("Error starting jobs: %v\n", err)
+		cleanup()
 		r.failClaimedJob(job.JobID, 1, fmt.Sprintf("failed to start process: %v", err))
 		return false
 	}
+	// The process is already running here, so a failure to move it into the
+	// cgroup can't cleanly fail the job — log it (the job runs unconfined)
+	// instead of panicking the runner.
 	if r.useCgroupV2 && support.AmIRoot() {
 		pid := strconv.Itoa(cmd.Process.Pid)
-		support.MustWriteFile(filepath.Join(cgroupV2Path, "cgroup.procs"), pid)
+		if err := os.WriteFile(filepath.Join(cgroupV2Path, "cgroup.procs"), []byte(pid), 0644); err != nil {
+			r.logf("Job %s: failed to add pid %s to cgroup (running unconfined): %v\n", job.JobID, pid, err)
+		}
 	} else if r.useCgroupV1 && support.AmIRoot() {
 		pid := strconv.Itoa(cmd.Process.Pid)
-		support.MustWriteFile(filepath.Join(cgroupV1BaseCPU, "tasks"), pid)
-		support.MustWriteFile(filepath.Join(cgroupV1BaseMem, "tasks"), pid)
+		if err := os.WriteFile(filepath.Join(cgroupV1BaseCPU, "tasks"), []byte(pid), 0644); err != nil {
+			r.logf("Job %s: failed to add pid %s to cpu cgroup: %v\n", job.JobID, pid, err)
+		}
+		if err := os.WriteFile(filepath.Join(cgroupV1BaseMem, "tasks"), []byte(pid), 0644); err != nil {
+			r.logf("Job %s: failed to add pid %s to memory cgroup: %v\n", job.JobID, pid, err)
+		}
 	}
 
 	myStatus := jobStatus{job: job, running: false, returnCode: 0, cmd: cmd, startTime: time.Now()}
