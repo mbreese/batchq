@@ -54,11 +54,9 @@ type simpleRunner struct {
 }
 
 type jobStatus struct {
-	job        *api.JobDTO
-	cmd        *exec.Cmd
-	running    bool
-	returnCode int
-	startTime  time.Time
+	job       *api.JobDTO
+	cmd       *exec.Cmd
+	startTime time.Time
 }
 
 /*
@@ -781,7 +779,7 @@ func (r *simpleRunner) startJob(job *api.JobDTO) bool {
 		}
 	}
 
-	myStatus := jobStatus{job: job, running: false, returnCode: 0, cmd: cmd, startTime: time.Now()}
+	myStatus := jobStatus{job: job, cmd: cmd, startTime: time.Now()}
 	r.curJobs = append(r.curJobs, myStatus)
 
 	if r.availProcs != -1 && jobProcs > 0 {

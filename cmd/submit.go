@@ -95,8 +95,7 @@ var submitCmd = &cobra.Command{
 			details[jobs.ResourcePrefix+"host"] = v
 		}
 		for k, v := range Config.JobDefaults.Resources {
-			switch k {
-			case "procs", "mem", "walltime":
+			if jobs.IsReservedResourceName(k) {
 				log.Fatalf("[job_defaults.resources] %q is reserved; use procs/mem/walltime", k)
 			}
 			details[jobs.ResourcePrefix+k] = v
@@ -371,16 +370,11 @@ var submitCmd = &cobra.Command{
 
 		// generic required resources (--resource name=value / #BATCHQ -resource ...)
 		for _, entry := range jobResources {
-			name, val, _ := strings.Cut(entry, "=")
-			name = strings.TrimSpace(name)
-			if name == "" || strings.ContainsAny(name, " \t") {
-				log.Fatalf("Bad --resource name: %q", entry)
+			name, val, err := jobs.ParseResourceEntry(entry)
+			if err != nil {
+				log.Fatalf("%v", err)
 			}
-			switch name {
-			case "procs", "mem", "walltime":
-				log.Fatalf("--resource %q is reserved; use -p/-m/-t instead", name)
-			}
-			details[jobs.ResourcePrefix+name] = strings.TrimSpace(val)
+			details[jobs.ResourcePrefix+name] = val
 		}
 
 		// if the job name isn't set, look for a default option
